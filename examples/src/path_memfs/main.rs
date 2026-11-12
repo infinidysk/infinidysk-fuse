@@ -6,8 +6,8 @@ use std::num::NonZeroU32;
 use std::time::{Duration, SystemTime};
 
 use bytes::{Buf, BufMut, BytesMut};
-use fuse3::path::prelude::*;
-use fuse3::{Errno, MountOptions, Result};
+use infinidysk_fuse::path::prelude::*;
+use infinidysk_fuse::{Errno, MountOptions, Result};
 use futures_util::{stream, Stream, StreamExt};
 use libc::mode_t;
 use tokio::signal;
@@ -35,7 +35,7 @@ impl Entry {
                 #[cfg(target_os = "macos")]
                 crtime: SystemTime::UNIX_EPOCH.into(),
                 kind: FileType::Directory,
-                perm: fuse3::perm_from_mode_and_kind(FileType::Directory, dir.mode),
+                perm: infinidysk_fuse::perm_from_mode_and_kind(FileType::Directory, dir.mode),
                 nlink: 0,
                 uid: 0,
                 gid: 0,
@@ -54,7 +54,7 @@ impl Entry {
                 #[cfg(target_os = "macos")]
                 crtime: SystemTime::UNIX_EPOCH.into(),
                 kind: FileType::RegularFile,
-                perm: fuse3::perm_from_mode_and_kind(FileType::RegularFile, file.mode),
+                perm: infinidysk_fuse::perm_from_mode_and_kind(FileType::RegularFile, file.mode),
                 nlink: 0,
                 uid: 0,
                 gid: 0,

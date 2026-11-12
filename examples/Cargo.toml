@@ -24,7 +24,7 @@ name = "path_memfs"
 path = "src/path_memfs/main.rs"
 
 [dependencies]
-fuse3 = { path = "../", features = ["tokio-runtime", "unprivileged"] }
+infinidysk-fuse = { path = "../", features = ["tokio-runtime", "unprivileged"] }
 libc = "0.2.183"
 tokio = { version = "1.50", features = ["macros", "rt", "time", "signal"] }
 futures-util = "0.3.32"

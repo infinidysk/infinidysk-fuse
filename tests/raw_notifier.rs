@@ -19,7 +19,7 @@ use std::{
 };
 
 use bytes::Bytes;
-use fuse3::{FileType, MountOptions, Result, raw::prelude::*};
+use infinidysk_fuse::{FileType, MountOptions, Result, raw::prelude::*};
 struct State {
     content: Mutex<Vec<u8>>,
     entry: Mutex<Option<u64>>,

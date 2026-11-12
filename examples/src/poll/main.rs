@@ -7,8 +7,8 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
-use fuse3::raw::prelude::*;
-use fuse3::{MountOptions, Result};
+use infinidysk_fuse::raw::prelude::*;
+use infinidysk_fuse::{MountOptions, Result};
 use futures_util::stream;
 use futures_util::stream::Stream;
 use mio::unix::SourceFd;

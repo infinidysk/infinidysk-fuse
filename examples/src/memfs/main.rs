@@ -8,8 +8,8 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use bytes::{Buf, BytesMut};
-use fuse3::raw::prelude::*;
-use fuse3::{Errno, Inode, MountOptions, Result};
+use infinidysk_fuse::raw::prelude::*;
+use infinidysk_fuse::{Errno, Inode, MountOptions, Result};
 use futures_util::stream;
 use futures_util::stream::Stream;
 use futures_util::StreamExt;
@@ -48,7 +48,7 @@ impl Entry {
                     #[cfg(target_os = "macos")]
                     crtime: SystemTime::UNIX_EPOCH.into(),
                     kind: FileType::Directory,
-                    perm: fuse3::perm_from_mode_and_kind(FileType::Directory, dir.mode),
+                    perm: infinidysk_fuse::perm_from_mode_and_kind(FileType::Directory, dir.mode),
                     nlink: nlink as _,
                     uid: 0,
                     gid: 0,
@@ -73,7 +73,7 @@ impl Entry {
                     #[cfg(target_os = "macos")]
                     crtime: SystemTime::UNIX_EPOCH.into(),
                     kind: FileType::RegularFile,
-                    perm: fuse3::perm_from_mode_and_kind(FileType::RegularFile, file.mode),
+                    perm: infinidysk_fuse::perm_from_mode_and_kind(FileType::RegularFile, file.mode),
                     nlink: nlink as _,
                     uid: 0,
                     gid: 0,

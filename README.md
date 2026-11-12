@@ -1,12 +1,12 @@
-# fuse3
-an async version fuse library for rust
+# infinidysk-fuse
+an async version fuse library for rust, forked from [fuse3](https://github.com/Sherlock-Holo/fuse3)
 
-[![Cargo](https://img.shields.io/crates/v/fuse3.svg)](
-https://crates.io/crates/fuse3)
-[![Documentation](https://docs.rs/fuse3/badge.svg)](
-https://docs.rs/fuse3)
+[![Cargo](https://img.shields.io/crates/v/infinidysk-fuse.svg)](
+https://crates.io/crates/infinidysk-fuse)
+[![Documentation](https://docs.rs/infinidysk-fuse/badge.svg)](
+https://docs.rs/infinidysk-fuse)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](
-https://github.com/Sherlock-Holo/fuse3)
+https://github.com/infinidysk/infinidysk-fuse)
 
 ## feature
 

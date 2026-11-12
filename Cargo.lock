@@ -247,8 +247,8 @@ name = "examples"
 version = "0.1.0"
 dependencies = [
  "bytes",
- "fuse3",
  "futures-util",
+ "infinidysk-fuse",
  "libc",
  "mio 0.8.11",
  "tempfile",
@@ -268,29 +268,6 @@ name = "foldhash"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d9c4f5dac5e15c24eb999c26181a6ca40b39fe946cbe4c263c7209467bc83af2"
-
-[[package]]
-name = "fuse3"
-version = "0.10.0"
-dependencies = [
- "async-fs",
- "async-global-executor",
- "async-io",
- "async-lock",
- "async-notify",
- "async-process",
- "bytes",
- "futures-util",
- "libc",
- "nix",
- "slab",
- "tempfile",
- "tokio",
- "tracing",
- "trait-make",
- "which",
- "zerocopy",
-]
 
 [[package]]
 name = "futures-core"
@@ -412,6 +389,29 @@ dependencies = [
  "hashbrown 0.16.1",
  "serde",
  "serde_core",
+]
+
+[[package]]
+name = "infinidysk-fuse"
+version = "0.10.0"
+dependencies = [
+ "async-fs",
+ "async-global-executor",
+ "async-io",
+ "async-lock",
+ "async-notify",
+ "async-process",
+ "bytes",
+ "futures-util",
+ "libc",
+ "nix",
+ "slab",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "trait-make",
+ "which",
+ "zerocopy",
 ]
 
 [[package]]
