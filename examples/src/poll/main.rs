@@ -7,10 +7,10 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
-use infinidysk_fuse::raw::prelude::*;
-use infinidysk_fuse::{MountOptions, Result};
 use futures_util::stream;
 use futures_util::stream::Stream;
+use infinidysk_fuse::raw::prelude::*;
+use infinidysk_fuse::{MountOptions, Result};
 use mio::unix::SourceFd;
 use mio::{Events, Interest, Token};
 use tokio::time;

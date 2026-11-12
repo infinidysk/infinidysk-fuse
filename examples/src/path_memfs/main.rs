@@ -6,9 +6,9 @@ use std::num::NonZeroU32;
 use std::time::{Duration, SystemTime};
 
 use bytes::{Buf, BufMut, BytesMut};
+use futures_util::{stream, Stream, StreamExt};
 use infinidysk_fuse::path::prelude::*;
 use infinidysk_fuse::{Errno, MountOptions, Result};
-use futures_util::{stream, Stream, StreamExt};
 use libc::mode_t;
 use tokio::signal;
 use tokio::sync::RwLock;

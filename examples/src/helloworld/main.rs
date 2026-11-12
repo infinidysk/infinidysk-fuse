@@ -4,10 +4,10 @@ use std::num::NonZeroU32;
 use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
-use infinidysk_fuse::raw::prelude::*;
-use infinidysk_fuse::{MountOptions, Result};
 use futures_util::stream;
 use futures_util::stream::Stream;
+use infinidysk_fuse::raw::prelude::*;
+use infinidysk_fuse::{MountOptions, Result};
 use tracing::Level;
 
 const CONTENT: &str = "hello world\n";

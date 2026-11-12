@@ -8,11 +8,11 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use bytes::{Buf, BytesMut};
-use infinidysk_fuse::raw::prelude::*;
-use infinidysk_fuse::{Errno, Inode, MountOptions, Result};
 use futures_util::stream;
 use futures_util::stream::Stream;
 use futures_util::StreamExt;
+use infinidysk_fuse::raw::prelude::*;
+use infinidysk_fuse::{Errno, Inode, MountOptions, Result};
 use libc::mode_t;
 use tokio::signal;
 use tokio::sync::RwLock;
@@ -73,7 +73,10 @@ impl Entry {
                     #[cfg(target_os = "macos")]
                     crtime: SystemTime::UNIX_EPOCH.into(),
                     kind: FileType::RegularFile,
-                    perm: infinidysk_fuse::perm_from_mode_and_kind(FileType::RegularFile, file.mode),
+                    perm: infinidysk_fuse::perm_from_mode_and_kind(
+                        FileType::RegularFile,
+                        file.mode,
+                    ),
                     nlink: nlink as _,
                     uid: 0,
                     gid: 0,
