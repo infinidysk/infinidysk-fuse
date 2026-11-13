@@ -16,7 +16,7 @@ use crate::raw::connection::{FuseConnection, KernelSide};
 use crate::raw::filesystem::Filesystem;
 #[cfg(feature = "file-lock")]
 use crate::raw::reply::ReplyLock;
-use crate::raw::reply::{FileAttr, ReplyCopyFileRange, ReplyEntry, ReplyInit};
+use crate::raw::reply::{FileAttr, ReplyCopyFileRange, ReplyEntry, ReplyInit, ReplyXAttr};
 use crate::raw::request::Request;
 use crate::{FileType, Inode, MountOptions, Result, Timestamp};
 
@@ -28,6 +28,7 @@ const UNKNOWN_OPCODE: u32 = 9999;
 /// `copy_file_range` reports one byte more than it was asked to copy for this input handle.
 const OVERREPORTING_FH: u64 = 2;
 const WAIT: Duration = Duration::from_secs(5);
+const XATTR_DATA: &[u8] = b"abcd";
 
 #[derive(Debug, Default)]
 struct TestFs {
@@ -74,6 +75,32 @@ impl Filesystem for TestFs {
             Some("zero") => Err(0.into()),
             Some("negative") => Err(libc::c_int::MIN.into()),
             _ => Ok(()),
+        }
+    }
+
+    /// `user.size` always replies with a size and anything else with 4 bytes of data,
+    /// whatever size the kernel asked for.
+    async fn getxattr(
+        &self,
+        _req: Request,
+        _inode: Inode,
+        name: &OsStr,
+        _size: u32,
+    ) -> Result<ReplyXAttr> {
+        if name == "user.size" {
+            Ok(ReplyXAttr::Size(4))
+        } else {
+            Ok(ReplyXAttr::Data(XATTR_DATA.into()))
+        }
+    }
+
+    /// `HELLO` always replies with a size and anything else with 4 bytes of data,
+    /// whatever size the kernel asked for.
+    async fn listxattr(&self, _req: Request, inode: Inode, _size: u32) -> Result<ReplyXAttr> {
+        if inode == HELLO {
+            Ok(ReplyXAttr::Size(4))
+        } else {
+            Ok(ReplyXAttr::Data(XATTR_DATA.into()))
         }
     }
 
@@ -392,4 +419,53 @@ async fn malformed_init_gets_einval_and_ends_session() {
         .expect("session ends within the timeout")
         .expect("session task does not panic");
     assert!(result.is_err(), "session ended with {result:?}");
+}
+
+/// A `fuse_getxattr_in` asking for `size` bytes, followed by `name` for GETXATTR.
+fn xattr_body(size: u32, name: &[u8]) -> Vec<u8> {
+    let mut body = size.to_ne_bytes().to_vec();
+    body.resize(size_of::<fuse_getxattr_in>(), 0);
+    body.extend_from_slice(name);
+    body
+}
+
+#[tokio::test]
+async fn invalid_xattr_reply_is_eio() {
+    let getxattr = fuse_opcode::FUSE_GETXATTR as u32;
+    let listxattr = fuse_opcode::FUSE_LISTXATTR as u32;
+    let data_len = XATTR_DATA.len() as u32;
+    let mut harness = Harness::start();
+    harness.init(0).await;
+
+    // (opcode, nodeid, requested size, name): each reply breaks the request.
+    let invalid: [(u32, Inode, u32, &[u8]); 6] = [
+        (getxattr, HELLO, data_len - 1, b"user.data\0"),
+        (getxattr, HELLO, 0, b"user.data\0"),
+        (getxattr, HELLO, 8, b"user.size\0"),
+        (listxattr, ROOT, data_len - 1, b""),
+        (listxattr, ROOT, 0, b""),
+        (listxattr, HELLO, 8, b""),
+    ];
+
+    for (unique, (opcode, nodeid, size, name)) in (11..).zip(invalid) {
+        harness.send(opcode, unique, nodeid, &xattr_body(size, name));
+        assert_eq!(
+            out_header(&harness.reply().await),
+            (FUSE_OUT_HEADER_SIZE, -libc::EIO, unique),
+            "opcode {opcode}, nodeid {nodeid}, size {size}"
+        );
+    }
+
+    harness.send(getxattr, 20, HELLO, &xattr_body(data_len, b"user.data\0"));
+    let reply = harness.reply().await;
+    assert_eq!(out_header(&reply), (reply.len(), 0, 20));
+    assert_eq!(&reply[FUSE_OUT_HEADER_SIZE..], XATTR_DATA);
+
+    harness.send(listxattr, 21, HELLO, &xattr_body(0, b""));
+    let reply = harness.reply().await;
+    assert_eq!(reply.len(), FUSE_OUT_HEADER_SIZE + FUSE_GETXATTR_OUT_SIZE);
+    assert_eq!(out_header(&reply), (reply.len(), 0, 21));
+    assert_eq!(u32_at(&reply, FUSE_OUT_HEADER_SIZE), data_len);
+
+    harness.finish().await;
 }
