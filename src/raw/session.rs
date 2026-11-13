@@ -154,7 +154,7 @@ impl ResponseSender {
     async fn send_err(&self, request: &Request, err: Errno) {
         let out_header = fuse_out_header {
             len: FUSE_OUT_HEADER_SIZE as u32,
-            error: err.into(),
+            error: err.reply_code(),
             unique: request.unique,
         };
         self.send1(&out_header).await
@@ -1032,7 +1032,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
 
                 let init_out_header = fuse_out_header {
                     len: FUSE_OUT_HEADER_SIZE as u32,
-                    error: libc::EINVAL,
+                    error: -libc::EINVAL,
                     unique: request.unique,
                 };
 
@@ -1241,7 +1241,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             Err(err) => {
                 let init_out_header = fuse_out_header {
                     len: FUSE_OUT_HEADER_SIZE as u32,
-                    error: err.into(),
+                    error: err.reply_code(),
                     unique: request.unique,
                 };
 
@@ -1816,7 +1816,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             );
 
             let resp_value = if let Err(err) = fs.unlink(request, in_header.nodeid, &name).await {
-                err.into()
+                err.reply_code()
             } else {
                 0
             };
@@ -1866,7 +1866,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             );
 
             let resp_value = if let Err(err) = fs.rmdir(request, in_header.nodeid, &name).await {
-                err.into()
+                err.reply_code()
             } else {
                 0
             };
@@ -1961,7 +1961,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                 )
                 .await
             {
-                err.into()
+                err.reply_code()
             } else {
                 0
             };
@@ -2333,7 +2333,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                 )
                 .await
             {
-                err.into()
+                err.reply_code()
             } else {
                 0
             };
@@ -2388,7 +2388,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                 .fsync(request, in_header.nodeid, fsync_in.fh, data_sync)
                 .await
             {
-                err.into()
+                err.reply_code()
             } else {
                 0
             };
@@ -2486,7 +2486,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                 )
                 .await
             {
-                err.into()
+                err.reply_code()
             } else {
                 0
             };
@@ -2561,6 +2561,18 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                 Ok(xattr) => xattr,
             };
 
+            if !xattr_reply_fits(getxattr_in.size, &xattr) {
+                error!(
+                    unique = request.unique,
+                    size = getxattr_in.size,
+                    data_len = ?xattr_data_len(&xattr),
+                    "getxattr reply does not fit the requested size, replying EIO"
+                );
+
+                resp_sender.send_err(&request, libc::EIO.into()).await;
+                return;
+            }
+
             match xattr {
                 ReplyXAttr::Size(size) => {
                     let getxattr_out = fuse_getxattr_out { size, _padding: 0 };
@@ -2577,8 +2589,6 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                 }
 
                 ReplyXAttr::Data(xattr_data) => {
-                    // TODO check is right way or not
-                    // TODO should we check data length or not
                     let out_header = fuse_out_header {
                         len: (FUSE_OUT_HEADER_SIZE + xattr_data.len()) as u32,
                         error: 0,
@@ -2636,6 +2646,18 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                 Ok(xattr) => xattr,
             };
 
+            if !xattr_reply_fits(listxattr_in.size, &xattr) {
+                error!(
+                    unique = request.unique,
+                    size = listxattr_in.size,
+                    data_len = ?xattr_data_len(&xattr),
+                    "listxattr reply does not fit the requested size, replying EIO"
+                );
+
+                resp_sender.send_err(&request, libc::EIO.into()).await;
+                return;
+            }
+
             match xattr {
                 ReplyXAttr::Size(size) => {
                     let getxattr_out = fuse_getxattr_out { size, _padding: 0 };
@@ -2652,8 +2674,6 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                 }
 
                 ReplyXAttr::Data(xattr_data) => {
-                    // TODO check is right way or not
-                    // TODO should we check data length or not
                     let out_header = fuse_out_header {
                         len: (FUSE_OUT_HEADER_SIZE + xattr_data.len()) as u32,
                         error: 0,
@@ -2702,7 +2722,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
 
             let resp_value =
                 if let Err(err) = fs.removexattr(request, in_header.nodeid, &name).await {
-                    err.into()
+                    err.reply_code()
                 } else {
                     0
                 };
@@ -2755,7 +2775,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                 .flush(request, in_header.nodeid, flush_in.fh, flush_in.lock_owner)
                 .await
             {
-                err.into()
+                err.reply_code()
             } else {
                 0
             };
@@ -2970,7 +2990,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                 .releasedir(request, in_header.nodeid, release_in.fh, release_in.flags)
                 .await
             {
-                err.into()
+                err.reply_code()
             } else {
                 0
             };
@@ -3025,7 +3045,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                 .fsyncdir(request, in_header.nodeid, fsync_in.fh, data_sync)
                 .await
             {
-                err.into()
+                err.reply_code()
             } else {
                 0
             };
@@ -3164,7 +3184,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                 )
                 .await
             {
-                err.into()
+                err.reply_code()
             } else {
                 0
             };
@@ -3215,7 +3235,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
 
             let resp_value =
                 if let Err(err) = fs.access(request, in_header.nodeid, access_in.mask).await {
-                    err.into()
+                    err.reply_code()
                 } else {
                     0
                 };
@@ -3344,7 +3364,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             );
 
             let resp_value = if let Err(err) = fs.interrupt(request, interrupt_in.unique).await {
-                err.into()
+                err.reply_code()
             } else {
                 0
             };
@@ -3657,7 +3677,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                 )
                 .await
             {
-                err.into()
+                err.reply_code()
             } else {
                 0
             };
@@ -3877,7 +3897,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                 )
                 .await
             {
-                err.into()
+                err.reply_code()
             } else {
                 0
             };
@@ -4033,6 +4053,24 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
 
             resp_sender.send2(&out_header, write_out.as_bytes()).await;
         });
+    }
+}
+
+/// Whether a GETXATTR or LISTXATTR reply matches what the kernel asked for.
+///
+/// A zero `size` asks for the length only; a nonzero `size` asks for data that fits in it.
+fn xattr_reply_fits(size: u32, reply: &ReplyXAttr) -> bool {
+    match reply {
+        ReplyXAttr::Size(_) => size == 0,
+        ReplyXAttr::Data(data) => size != 0 && data.len() <= size as usize,
+    }
+}
+
+/// `None` for a size-only reply.
+fn xattr_data_len(reply: &ReplyXAttr) -> Option<usize> {
+    match reply {
+        ReplyXAttr::Size(_) => None,
+        ReplyXAttr::Data(data) => Some(data.len()),
     }
 }
 
