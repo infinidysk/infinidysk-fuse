@@ -42,6 +42,8 @@ jobs:
           cargo check --locked -p infinidysk-fuse --lib --no-default-features --features=async-io-runtime
 
       - name: Check invalid runtime selections fail clearly
+        env:
+          CARGO_TERM_COLOR: never
         run: |
           for features in tokio-runtime,async-io-runtime ""; do
             if cargo check --locked -p infinidysk-fuse --lib --no-default-features --features="$features" 2> check.log; then
@@ -138,11 +140,7 @@ jobs:
       - name: Build on FreeBSD
         uses: vmactions/freebsd-vm@v1
         with:
-          release:test --locked -p infinidysk-fuse --lib --features=tokio-runtime,file-lock,unprivileged
-            cargo test --locked -p infinidysk-fuse --lib --features=async-io-runtime,file-lock,unprivileged
-            cargo check --locked -p infinidysk-fuse --lib --no-default-features --features=tokio-runtime
-            cargo check --locked -p infinidysk-fuse --lib --no-default-features --features=async-io-runtime
-            cargo  "15.0"
+          release: "15.0"
           usesh: true
           prepare: |
             pkg install -y curl
@@ -153,6 +151,10 @@ jobs:
             rustup component add clippy
             cargo clippy --all-targets --features=tokio-runtime,file-lock,unprivileged
             cargo clippy --all-targets --features=async-io-runtime,file-lock,unprivileged
+            cargo test --locked -p infinidysk-fuse --lib --features=tokio-runtime,file-lock,unprivileged
+            cargo test --locked -p infinidysk-fuse --lib --features=async-io-runtime,file-lock,unprivileged
+            cargo check --locked -p infinidysk-fuse --lib --no-default-features --features=tokio-runtime
+            cargo check --locked -p infinidysk-fuse --lib --no-default-features --features=async-io-runtime
             cargo doc --features=file-lock,unprivileged,tokio-runtime
 
   minver:
