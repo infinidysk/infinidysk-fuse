@@ -14,11 +14,14 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::ffi::OsStringExt;
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
 use std::os::unix::io::AsRawFd;
+use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::pin::{Pin, pin};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::Context;
 use std::task::Poll;
+use std::time::Duration;
 
 #[cfg(all(not(feature = "tokio-runtime"), feature = "async-io-runtime"))]
 use async_fs::read_dir;
@@ -31,8 +34,7 @@ use async_global_executor::{self as task, Task as JoinHandle};
     feature = "unprivileged"
 ))]
 use async_process::Command;
-use futures_util::future::FutureExt;
-use futures_util::select;
+use futures_util::future::{self, Either, FutureExt};
 use futures_util::stream::StreamExt;
 use nix::mount;
 #[cfg(any(target_os = "freebsd", target_os = "macos"))]
@@ -103,16 +105,21 @@ impl Drop for MountHandle {
     }
 }
 
-/// A sender for sending response to kernel, it will send response immediately when call send method, and notify session when send failed.
+/// A sender for sending response to kernel, it will send response immediately when call send method, and end the session when send failed.
 #[derive(Debug)]
 pub(crate) struct ResponseSender {
-    /// notify session when send failed, session will stop and unmount when receive this notify
-    send_failed: Arc<async_notify::Notify>,
+    /// Set when a write failed in a way that ends the session.
+    failed: AtomicBool,
     /// connection to write response
     connection: Arc<FuseConnection>,
 }
 
 impl ResponseSender {
+    fn fail(&self) {
+        self.failed.store(true, Ordering::SeqCst);
+        self.connection.shut_down();
+    }
+
     /// send response with only header, no data
     pub(crate) async fn send1(&self, header: &fuse_out_header) {
         self.send(&[IoSlice::new(header.as_bytes())]).await;
@@ -144,7 +151,7 @@ impl ResponseSender {
                 );
             } else {
                 error!("reply fuse failed {}", err);
-                self.send_failed.notify();
+                self.fail();
             }
         }
     }
@@ -171,7 +178,7 @@ impl ResponseSender {
             warn!(%err, "kernel rejected a notification, the session continues");
         } else {
             error!(%err, "notification write failed");
-            self.send_failed.notify();
+            self.fail();
         }
     }
 }
@@ -198,6 +205,139 @@ fn notification_rejected_locally(err: &IoError) -> bool {
 
     err.raw_os_error()
         .is_some_and(|errno| LOCAL.contains(&errno))
+}
+
+/// How long shutdown waits for request handlers before cancelling them.
+// ponytail: fixed until 0.11 can make it a mount option.
+const CALLBACK_GRACE: Duration = Duration::from_secs(10);
+
+/// Spawned handlers are kept until this many are tracked, then finished ones are dropped.
+const REAP_AT: usize = 64;
+
+/// The request handlers a session spawned, so shutdown can settle them before `destroy`.
+#[derive(Debug)]
+struct RequestTasks {
+    running: Vec<JoinHandle<()>>,
+    /// Reap when `running` reaches this length; doubling keeps reaping amortized O(1) per spawn.
+    reap_at: usize,
+    shared: Arc<RequestTasksShared>,
+}
+
+#[derive(Debug)]
+struct RequestTasksShared {
+    connection: Arc<FuseConnection>,
+    panicked: AtomicBool,
+}
+
+impl RequestTasks {
+    fn new(connection: Arc<FuseConnection>) -> Self {
+        Self {
+            running: Vec::new(),
+            reap_at: REAP_AT,
+            shared: Arc::new(RequestTasksShared {
+                connection,
+                panicked: AtomicBool::new(false),
+            }),
+        }
+    }
+
+    fn panicked(&self) -> bool {
+        self.shared.panicked.load(Ordering::SeqCst)
+    }
+
+    /// A panic ends the session, because the handler's request never gets a reply.
+    fn spawn<F>(&mut self, span: Span, fut: F)
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        if self.running.len() >= self.reap_at {
+            self.running.retain(|task| !task.is_finished());
+            self.reap_at = (self.running.len() * 2).max(REAP_AT);
+        }
+
+        let shared = self.shared.clone();
+        let fut = AssertUnwindSafe(fut)
+            .catch_unwind()
+            .map(move |res| {
+                if res.is_err() {
+                    error!("request handler panicked, ending the session");
+                    shared.panicked.store(true, Ordering::SeqCst);
+                    shared.connection.shut_down();
+                }
+            })
+            .instrument(span);
+
+        self.running.push(task::spawn(fut));
+    }
+
+    async fn join_all(&mut self) {
+        while let Some(task) = self.running.last_mut() {
+            // The handler catches its own panic, so the join has nothing to report.
+            let _ = task.await;
+            self.running.pop();
+        }
+    }
+
+    /// Awaits cancellation, so a cancelled handler no longer runs when this returns.
+    #[cfg(all(not(feature = "async-io-runtime"), feature = "tokio-runtime"))]
+    async fn cancel_all(&mut self) {
+        for task in &self.running {
+            task.abort();
+        }
+        self.join_all().await;
+    }
+
+    /// Awaits cancellation, so a cancelled handler no longer runs when this returns.
+    #[cfg(all(not(feature = "tokio-runtime"), feature = "async-io-runtime"))]
+    async fn cancel_all(&mut self) {
+        for task in self.running.drain(..) {
+            task.cancel().await;
+        }
+    }
+
+    /// Waits up to `grace` for the handlers, then cancels the rest. Returns whether any panicked.
+    async fn settle(&mut self, grace: Duration) -> bool {
+        self.running.retain(|task| !task.is_finished());
+        if self.running.is_empty() {
+            return self.panicked();
+        }
+
+        let drained = {
+            let join_all = pin!(self.join_all());
+            let expired = pin!(grace_expired(grace));
+            matches!(future::select(join_all, expired).await, Either::Left(_))
+        };
+
+        if !drained {
+            warn!(
+                remaining = self.running.len(),
+                "request handlers outlived the shutdown grace period, cancelling them"
+            );
+            self.cancel_all().await;
+        }
+
+        self.panicked()
+    }
+}
+
+/// Completes after `grace`. A thread, not a runtime timer, because the runtime may have timers disabled.
+async fn grace_expired(grace: Duration) {
+    let expired = Arc::new(async_notify::Notify::new());
+    let notify = expired.clone();
+    let spawned = std::thread::Builder::new()
+        .name("fuse-shutdown-grace".into())
+        .spawn(move || {
+            std::thread::sleep(grace);
+            notify.notify();
+        });
+
+    match spawned {
+        Ok(_) => expired.notified().await,
+        Err(err) => {
+            warn!(%err, "no shutdown timer, waiting for request handlers without a deadline");
+            future::pending().await
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -330,6 +470,8 @@ pub struct Session<FS> {
     fuse_connection: Option<Arc<FuseConnection>>,
     filesystem: Option<Arc<FS>>,
     response_sender: Option<Arc<ResponseSender>>,
+    tasks: Option<RequestTasks>,
+    callback_grace: Duration,
     mount_options: MountOptions,
 }
 
@@ -362,6 +504,8 @@ impl<FS> Session<FS> {
             fuse_connection: None,
             filesystem: None,
             response_sender: None,
+            tasks: None,
+            callback_grace: CALLBACK_GRACE,
             mount_options,
         }
     }
@@ -586,31 +730,35 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
     }
 
     async fn inner_mount(mut self) -> IoResult<()> {
-        let fuse_write_connection = self.fuse_connection.as_ref().unwrap().clone();
+        let connection = self
+            .fuse_connection
+            .clone()
+            .expect("mount stores the connection before spawning the session");
 
-        let send_failed = Arc::new(async_notify::Notify::new());
-        self.response_sender.replace(Arc::new(ResponseSender {
-            send_failed: send_failed.clone(),
-            connection: fuse_write_connection,
-        }));
+        let sender = Arc::new(ResponseSender {
+            failed: AtomicBool::new(false),
+            connection: connection.clone(),
+        });
+        self.response_sender.replace(sender.clone());
+        self.tasks.replace(RequestTasks::new(connection));
 
-        let dispatch_task = self.dispatch().fuse();
-        let mut dispatch_task = pin!(dispatch_task);
+        let result = self.dispatch().await;
 
-        let send_failed = send_failed.notified().fuse();
-        let mut send_failed = pin!(send_failed);
-
-        select! {
-            _ = send_failed => {
-                return Err(std::io::Error::other("send response failed"))
-            }
-
-            dispatch_result = dispatch_task => {
-                dispatch_result?;
-            }
+        if sender.failed.load(Ordering::SeqCst) {
+            return Err(IoError::other("send response failed"));
         }
 
-        Ok(())
+        result
+    }
+
+    fn spawn<F>(&mut self, span: Span, fut: F)
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        self.tasks
+            .as_mut()
+            .expect("inner_mount creates the request tasks before dispatch")
+            .spawn(span, fut);
     }
 
     #[instrument(level = "debug", skip(self, fs), ret, err)]
@@ -784,25 +932,42 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         let max_write = self.init_filesystem(&fs, &fuse_connection).await?.get() as usize;
         let buffer_size = (max_write + FUSE_WRITE_IN_SIZE).max(FUSE_MIN_READ_BUFFER_SIZE);
 
-        let mut header_buffer = vec![0; FUSE_IN_HEADER_SIZE];
-        let mut data_buffer = vec![0; buffer_size];
+        let header_buffer = vec![0; FUSE_IN_HEADER_SIZE];
+        let data_buffer = vec![0; buffer_size];
 
+        let (destroy_request, mut result) = self
+            .serve(&fuse_connection, fs.clone(), header_buffer, data_buffer)
+            .await;
+
+        let tasks = self
+            .tasks
+            .as_mut()
+            .expect("inner_mount creates the request tasks before dispatch");
+        if tasks.settle(self.callback_grace).await && result.is_ok() {
+            result = Err(IoError::other("request handler panicked"));
+        }
+
+        fs.destroy(destroy_request).await;
+        debug!("fuse destroyed");
+
+        result
+    }
+
+    /// Reads and dispatches requests until the session should end. Returns the request to
+    /// pass to `destroy` and the session result.
+    async fn serve(
+        &mut self,
+        fuse_connection: &FuseConnection,
+        fs: Arc<FS>,
+        mut header_buffer: Vec<u8>,
+        mut data_buffer: Vec<u8>,
+    ) -> (Request, IoResult<()>) {
         loop {
             let in_header = match self
-                .read_fuse_request(&fuse_connection, header_buffer, data_buffer)
+                .read_fuse_request(fuse_connection, header_buffer, data_buffer)
                 .await
             {
-                ReadResult::Destroy => {
-                    fs.destroy(Request {
-                        unique: 0,
-                        uid: 0,
-                        gid: 0,
-                        pid: 0,
-                    })
-                    .await;
-
-                    return Ok(());
-                }
+                ReadResult::Destroy => return (Request::default(), Ok(())),
 
                 ReadResult::Request {
                     in_header,
@@ -846,18 +1011,18 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                 fuse_opcode::FUSE_INIT => {
                     warn!("duplicated fuse init request");
 
-                    self.handle_init(request, data_ref, &fuse_connection, &fs)
-                        .await?;
+                    if let Err(err) = self
+                        .handle_init(request, data_ref, fuse_connection, &fs)
+                        .await
+                    {
+                        return (Request::default(), Err(err));
+                    }
                 }
 
                 fuse_opcode::FUSE_DESTROY => {
                     debug!("receive fuse destroy");
 
-                    fs.destroy(request).await;
-
-                    debug!("fuse destroyed");
-
-                    return Ok(());
+                    return (request, Ok(()));
                 }
 
                 fuse_opcode::FUSE_LOOKUP => {
@@ -1384,7 +1549,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         let resp_sender = self.response_sender().clone();
         let fs = fs.clone();
 
-        spawn(debug_span!("fuse_lookup"), async move {
+        self.spawn(debug_span!("fuse_lookup"), async move {
             debug!(
                 "lookup unique {} name {:?} in parent {}",
                 request.unique, name, in_header.nodeid
@@ -1436,7 +1601,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
 
         let fs = fs.clone();
 
-        spawn(debug_span!("fuse_forget"), async move {
+        self.spawn(debug_span!("fuse_forget"), async move {
             debug!(
                 "forget unique {} inode {} nlookup {}",
                 request.unique, in_header.nodeid, forget_in.nlookup
@@ -1475,7 +1640,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         let resp_sender = self.response_sender().clone();
         let fs = fs.clone();
 
-        spawn(debug_span!("fuse_getattr"), async move {
+        self.spawn(debug_span!("fuse_getattr"), async move {
             debug!(
                 "getattr unique {} inode {}",
                 request.unique, in_header.nodeid
@@ -1542,7 +1707,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         let resp_sender = self.response_sender().clone();
         let fs = fs.clone();
 
-        spawn(debug_span!("fuse_setattr"), async move {
+        self.spawn(debug_span!("fuse_setattr"), async move {
             let set_attr = SetAttr::from(&setattr_in);
 
             let fh = if setattr_in.valid & FATTR_FH > 0 {
@@ -1580,7 +1745,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         let resp_sender = self.response_sender().clone();
         let fs = fs.clone();
 
-        spawn(debug_span!("fuse_readlink"), async move {
+        self.spawn(debug_span!("fuse_readlink"), async move {
             debug!(
                 "readlink unique {} inode {}",
                 request.unique, in_header.nodeid
@@ -1647,7 +1812,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         let resp_sender = self.response_sender().clone();
         let fs = fs.clone();
 
-        spawn(debug_span!("fuse_symlink"), async move {
+        self.spawn(debug_span!("fuse_symlink"), async move {
             debug!(
                 "symlink unique {} parent {} name {:?} link {:?}",
                 request.unique, in_header.nodeid, name, link_name
@@ -1721,7 +1886,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         let resp_sender = self.response_sender().clone();
         let fs = fs.clone();
 
-        spawn(debug_span!("fuse_mknod"), async move {
+        self.spawn(debug_span!("fuse_mknod"), async move {
             debug!(
                 "mknod unique {} parent {} name {:?} {:?}",
                 request.unique, in_header.nodeid, name, mknod_in
@@ -1801,7 +1966,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         let resp_sender = self.response_sender().clone();
         let fs = fs.clone();
 
-        spawn(debug_span!("fuse_mkdir"), async move {
+        self.spawn(debug_span!("fuse_mkdir"), async move {
             debug!(
                 "mkdir unique {} parent {} name {:?} {:?}",
                 request.unique, in_header.nodeid, name, mkdir_in
@@ -1869,7 +2034,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         let resp_sender = self.response_sender().clone();
         let fs = fs.clone();
 
-        spawn(debug_span!("fuse_unlink"), async move {
+        self.spawn(debug_span!("fuse_unlink"), async move {
             debug!(
                 "unlink unique {} parent {} name {:?}",
                 request.unique, in_header.nodeid, name
@@ -1919,7 +2084,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         let resp_sender = self.response_sender().clone();
         let fs = fs.clone();
 
-        spawn(debug_span!("fuse_rmdir"), async move {
+        self.spawn(debug_span!("fuse_rmdir"), async move {
             debug!(
                 "rmdir unique {} parent {} name {:?}",
                 request.unique, in_header.nodeid, name
@@ -2005,7 +2170,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         let resp_sender = self.response_sender().clone();
         let fs = fs.clone();
 
-        spawn(debug_span!("fuse_rename"), async move {
+        self.spawn(debug_span!("fuse_rename"), async move {
             debug!(
                 "rename unique {} parent {} name {:?} new parent {} new name {:?}",
                 request.unique, in_header.nodeid, name, rename_in.newdir, new_name
@@ -2081,7 +2246,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         let resp_sender = self.response_sender().clone();
         let fs = fs.clone();
 
-        spawn(debug_span!("fuse_link"), async move {
+        self.spawn(debug_span!("fuse_link"), async move {
             debug!(
                 "link unique {} inode {} new parent {} new name {:?}",
                 request.unique, link_in.oldnodeid, in_header.nodeid, name
@@ -2138,7 +2303,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         let resp_sender = self.response_sender().clone();
         let fs = fs.clone();
 
-        spawn(debug_span!("fuse_open"), async move {
+        self.spawn(debug_span!("fuse_open"), async move {
             debug!(
                 "open unique {} inode {} flags {}",
                 request.unique, in_header.nodeid, open_in.flags
@@ -2193,7 +2358,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         let resp_sender = self.response_sender().clone();
         let fs = fs.clone();
 
-        spawn(debug_span!("fuse_read"), async move {
+        self.spawn(debug_span!("fuse_read"), async move {
             debug!(
                 "read unique {} inode {} {:?}",
                 request.unique, in_header.nodeid, read_in
@@ -2271,7 +2436,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         let resp_sender = self.response_sender().clone();
         let fs = fs.clone();
 
-        spawn(debug_span!("fuse_write"), async move {
+        self.spawn(debug_span!("fuse_write"), async move {
             debug!(
                 "write unique {} inode {} {:?}",
                 request.unique, in_header.nodeid, write_in
@@ -2314,7 +2479,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         let resp_sender = self.response_sender().clone();
         let fs = fs.clone();
 
-        spawn(debug_span!("fuse_statfs"), async move {
+        self.spawn(debug_span!("fuse_statfs"), async move {
             debug!(
                 "statfs unique {} inode {}",
                 request.unique, in_header.nodeid
@@ -2369,7 +2534,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         let resp_sender = self.response_sender().clone();
         let fs = fs.clone();
 
-        spawn(debug_span!("fuse_release"), async move {
+        self.spawn(debug_span!("fuse_release"), async move {
             let flush = release_in.release_flags & FUSE_RELEASE_FLUSH > 0;
 
             debug!(
@@ -2436,7 +2601,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         let resp_sender = self.response_sender().clone();
         let fs = fs.clone();
 
-        spawn(debug_span!("fuse_fsync"), async move {
+        self.spawn(debug_span!("fuse_fsync"), async move {
             let data_sync = fsync_in.fsync_flags & 1 > 0;
 
             debug!(
@@ -2528,7 +2693,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         let resp_sender = self.response_sender().clone();
         let fs = fs.clone();
 
-        spawn(debug_span!("fuse_setxattr"), async move {
+        self.spawn(debug_span!("fuse_setxattr"), async move {
             debug!(
                 "setxattr unique {} inode {}",
                 request.unique, in_header.nodeid
@@ -2603,7 +2768,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         let resp_sender = self.response_sender().clone();
         let fs = fs.clone();
 
-        spawn(debug_span!("fuse_getxattr"), async move {
+        self.spawn(debug_span!("fuse_getxattr"), async move {
             debug!(
                 "getxattr unique {} inode {}",
                 request.unique, in_header.nodeid
@@ -2688,7 +2853,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         let resp_sender = self.response_sender().clone();
         let fs = fs.clone();
 
-        spawn(debug_span!("fuse_listxattr"), async move {
+        self.spawn(debug_span!("fuse_listxattr"), async move {
             debug!(
                 "listxattr unique {} inode {} size {}",
                 request.unique, in_header.nodeid, listxattr_in.size
@@ -2774,7 +2939,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         let resp_sender = self.response_sender().clone();
         let fs = fs.clone();
 
-        spawn(debug_span!("fuse_removexattr"), async move {
+        self.spawn(debug_span!("fuse_removexattr"), async move {
             debug!(
                 "removexattr unique {} inode {}",
                 request.unique, in_header.nodeid
@@ -2825,7 +2990,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         let resp_sender = self.response_sender().clone();
         let fs = fs.clone();
 
-        spawn(debug_span!("fuse_flush"), async move {
+        self.spawn(debug_span!("fuse_flush"), async move {
             debug!(
                 "flush unique {} inode {} fh {} lock_owner {}",
                 request.unique, in_header.nodeid, flush_in.fh, flush_in.lock_owner
@@ -2878,7 +3043,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         let resp_sender = self.response_sender().clone();
         let fs = fs.clone();
 
-        spawn(debug_span!("fuse_opendir"), async move {
+        self.spawn(debug_span!("fuse_opendir"), async move {
             debug!(
                 "opendir unique {} inode {} flags {}",
                 request.unique, in_header.nodeid, open_in.flags
@@ -2940,7 +3105,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         let resp_sender = self.response_sender().clone();
         let fs = fs.clone();
 
-        spawn(debug_span!("fuse_readdir"), async move {
+        self.spawn(debug_span!("fuse_readdir"), async move {
             debug!(
                 "readdir unique {} inode {} fh {} offset {}",
                 request.unique, in_header.nodeid, read_in.fh, read_in.offset
@@ -3040,7 +3205,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         let resp_sender = self.response_sender().clone();
         let fs = fs.clone();
 
-        spawn(debug_span!("fuse_releasedir"), async move {
+        self.spawn(debug_span!("fuse_releasedir"), async move {
             debug!(
                 "releasedir unique {} inode {} fh {} flags {}",
                 request.unique, in_header.nodeid, release_in.fh, release_in.flags
@@ -3093,7 +3258,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         let resp_sender = self.response_sender().clone();
         let fs = fs.clone();
 
-        spawn(debug_span!("fuse_fsyncdir"), async move {
+        self.spawn(debug_span!("fuse_fsyncdir"), async move {
             let data_sync = fsync_in.fsync_flags & 1 > 0;
 
             debug!(
@@ -3149,7 +3314,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         let resp_sender = self.response_sender().clone();
         let fs = fs.clone();
 
-        spawn(debug_span!("fuse_getlk"), async move {
+        self.spawn(debug_span!("fuse_getlk"), async move {
             debug!(
                 "getlk unique {} inode {} {:?}",
                 request.unique, in_header.nodeid, getlk_in
@@ -3224,7 +3389,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         let resp_sender = self.response_sender().clone();
         let fs = fs.clone();
 
-        spawn(debug_span!("fuse_setlk"), async move {
+        self.spawn(debug_span!("fuse_setlk"), async move {
             debug!(
                 "setlk unique {} inode {} block {} {:?}",
                 request.unique, in_header.nodeid, block, setlk_in
@@ -3287,7 +3452,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         let resp_sender = self.response_sender().clone();
         let fs = fs.clone();
 
-        spawn(debug_span!("fuse_access"), async move {
+        self.spawn(debug_span!("fuse_access"), async move {
             debug!(
                 "access unique {} inode {} mask {}",
                 request.unique, in_header.nodeid, access_in.mask
@@ -3357,7 +3522,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         let resp_sender = self.response_sender().clone();
         let fs = fs.clone();
 
-        spawn(debug_span!("fuse_create"), async move {
+        self.spawn(debug_span!("fuse_create"), async move {
             debug!(
                 "create unique {} parent {} name {:?} mode {} flags {}",
                 request.unique, in_header.nodeid, name, create_in.mode, create_in.flags
@@ -3417,7 +3582,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         let resp_sender = self.response_sender().clone();
         let fs = fs.clone();
 
-        spawn(debug_span!("fuse_interrupt"), async move {
+        self.spawn(debug_span!("fuse_interrupt"), async move {
             debug!(
                 "interrupt_in unique {} interrupt unique {}",
                 request.unique, interrupt_in.unique
@@ -3467,7 +3632,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         let resp_sender = self.response_sender().clone();
         let fs = fs.clone();
 
-        spawn(debug_span!("fuse_bmap"), async move {
+        self.spawn(debug_span!("fuse_bmap"), async move {
             debug!(
                 "bmap unique {} inode {} block size {} idx {}",
                 request.unique, in_header.nodeid, bmap_in.blocksize, bmap_in.block
@@ -3527,7 +3692,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
 
         let notify = self.get_notify();
 
-        spawn(debug_span!("fuse_poll"), async move {
+        self.spawn(debug_span!("fuse_poll"), async move {
             debug!(
                 "poll unique {} inode {} {:?}",
                 request.unique, in_header.nodeid, poll_in
@@ -3609,7 +3774,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
 
         let fs = fs.clone();
 
-        spawn(debug_span!("fuse_notify_reply"), async move {
+        self.spawn(debug_span!("fuse_notify_reply"), async move {
             if let Err(err) = fs
                 .notify_reply(
                     request,
@@ -3680,7 +3845,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
 
         let fs = fs.clone();
 
-        spawn(debug_span!("fuse_batch_forget"), async move {
+        self.spawn(debug_span!("fuse_batch_forget"), async move {
             let inodes = forgets
                 .into_iter()
                 .map(|forget_one| (forget_one.nodeid, forget_one.nlookup))
@@ -3720,7 +3885,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         let resp_sender = self.response_sender().clone();
         let fs = fs.clone();
 
-        spawn(debug_span!("fuse_fallocate"), async move {
+        self.spawn(debug_span!("fuse_fallocate"), async move {
             debug!(
                 "fallocate unique {} inode {} {:?}",
                 request.unique, in_header.nodeid, fallocate_in
@@ -3780,7 +3945,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         let resp_sender = self.response_sender().clone();
         let fs = fs.clone();
 
-        spawn(debug_span!("fuse_readdirplus"), async move {
+        self.spawn(debug_span!("fuse_readdirplus"), async move {
             debug!(
                 "readdirplus unique {} parent {} {:?}",
                 request.unique, in_header.nodeid, readdirplus_in
@@ -3935,7 +4100,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         let resp_sender = self.response_sender().clone();
         let fs = fs.clone();
 
-        spawn(debug_span!("fuse_rename2"), async move {
+        self.spawn(debug_span!("fuse_rename2"), async move {
             debug!(
                 "rename2 unique {} parent {} name {:?} new parent {} new name {:?} flags {}",
                 request.unique,
@@ -3997,7 +4162,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
 
         let fs = fs.clone();
 
-        spawn(debug_span!("fuse_lseek"), async move {
+        self.spawn(debug_span!("fuse_lseek"), async move {
             debug!(
                 "lseek unique {} inode {} {:?}",
                 request.unique, in_header.nodeid, lseek_in
@@ -4063,7 +4228,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         // The reply carries the copied count in a u32.
         let length = copy_file_range_in.len.min(u64::from(u32::MAX));
 
-        spawn(debug_span!("fuse_copy_file_range"), async move {
+        self.spawn(debug_span!("fuse_copy_file_range"), async move {
             debug!(
                 "reply_copy_file_range unique {} inode {} {:?}",
                 request.unique, in_header.nodeid, copy_file_range_in
