@@ -14,7 +14,7 @@ jobs:
     name: Linux
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -101,7 +101,7 @@ jobs:
     name: MacOS
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -135,7 +135,7 @@ jobs:
     name: FreeBSD
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Build on FreeBSD
         uses: vmactions/freebsd-vm@v1
@@ -162,7 +162,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: [linux, macos, freebsd]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust (nightly)
         uses: dtolnay/rust-toolchain@nightly
