@@ -59,7 +59,7 @@ jobs:
     name: Linux mounted tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install FUSE
         run: |
@@ -84,10 +84,10 @@ jobs:
     name: MSRV
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust 1.91
-        uses: dtolnay/rust-toolchain@1.91
+        uses: dtolnay/rust-toolchain@1.120
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
