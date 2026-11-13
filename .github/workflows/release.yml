@@ -39,7 +39,7 @@ jobs:
         with:
           ref: ${{ needs.release-please.outputs.tag_name }}
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@stable
+      - run: rustup toolchain install stable --profile minimal && rustup default stable
       # The crate needs a runtime feature to build; this only affects the verify step.
       - run: cargo publish --locked --features tokio-runtime,file-lock,unprivileged
         env:
