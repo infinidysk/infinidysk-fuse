@@ -212,6 +212,20 @@ impl FuseConnection {
             ConnectionMode::Memory(connection) => connection.write_vectored(bufs),
         }
     }
+
+    /// Writes one whole message from the calling thread, which the write may block.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn write_vectored_blocking(&self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
+        match &self.mode {
+            ConnectionMode::Block(connection) => (&connection.file).write_vectored(bufs),
+            #[cfg(feature = "unprivileged")]
+            ConnectionMode::NonBlock(connection) => {
+                uio::writev(&connection.fd, bufs).map_err(Into::into)
+            }
+            #[cfg(test)]
+            ConnectionMode::Memory(connection) => connection.write_vectored(bufs),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -232,6 +246,8 @@ enum ConnectionMode {
 struct BlockFuseConnection {
     file: File,
     read: Mutex<()>,
+    // Linux v6.12 fuse_dev_write handles concurrent whole-message writes independently.
+    #[cfg(not(target_os = "linux"))]
     write: Mutex<()>,
 }
 
@@ -246,7 +262,6 @@ impl BlockFuseConnection {
         Ok(Self {
             file,
             read: Mutex::new(()),
-            write: Mutex::new(()),
         })
     }
 
@@ -390,6 +405,7 @@ impl BlockFuseConnection {
     }
 
     async fn write_vectored(&self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
+        #[cfg(not(target_os = "linux"))]
         let _guard = self.write.lock().await;
         (&self.file).write_vectored(bufs)
     }
@@ -403,6 +419,7 @@ impl BlockFuseConnection {
 struct NonBlockFuseConnection {
     fd: AsyncFd<OwnedFd>,
     read: Mutex<()>,
+    #[cfg(target_os = "freebsd")]
     write: Mutex<()>,
 }
 
@@ -518,7 +535,6 @@ impl NonBlockFuseConnection {
         Ok(Self {
             fd: AsyncFd::new(fd)?,
             read: Mutex::new(()),
-            write: Mutex::new(()),
         })
     }
 
@@ -568,6 +584,7 @@ impl NonBlockFuseConnection {
     }
 
     async fn write_vectored(&self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
+        #[cfg(target_os = "freebsd")]
         let _guard = self.write.lock().await;
         uio::writev(&self.fd, bufs).map_err(Into::into)
     }

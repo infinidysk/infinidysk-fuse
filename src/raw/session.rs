@@ -119,6 +119,13 @@ pub(crate) struct ResponseSender {
     failed: AtomicBool,
     /// connection to write response
     connection: Arc<FuseConnection>,
+    /// Runs notification writes, which may be polled outside the runtime.
+    #[cfg(all(
+        target_os = "linux",
+        not(feature = "async-io-runtime"),
+        feature = "tokio-runtime"
+    ))]
+    runtime: tokio::runtime::Handle,
 }
 
 impl ResponseSender {
@@ -218,7 +225,12 @@ impl ResponseSender {
     /// Send a notification in a single write. An error the kernel scopes to this notification
     /// is logged; any other error ends the session, as for replies.
     pub(crate) async fn send_notification(&self, bufs: &[IoSlice<'_>]) {
-        let Err(err) = self.connection.write_vectored(bufs).await else {
+        #[cfg(target_os = "linux")]
+        let result = self.write_notification(bufs).await;
+        #[cfg(not(target_os = "linux"))]
+        let result = self.connection.write_vectored(bufs).await;
+
+        let Err(err) = result else {
             return;
         };
 
@@ -228,6 +240,28 @@ impl ResponseSender {
             error!(%err, "notification write failed");
             self.fail();
         }
+    }
+
+    /// Linux v6.12 fuse_reverse_inval_entry waits for a parent inode lock that a pending lookup holds
+    /// until its reply is written, so the write must not block an executor worker.
+    #[cfg(target_os = "linux")]
+    async fn write_notification(&self, bufs: &[IoSlice<'_>]) -> IoResult<usize> {
+        let mut message = Vec::with_capacity(bufs.iter().map(|buf| buf.len()).sum());
+        for buf in bufs {
+            message.extend_from_slice(buf);
+        }
+        let connection = self.connection.clone();
+        let write = move || connection.write_vectored_blocking(&[IoSlice::new(&message)]);
+
+        #[cfg(all(not(feature = "async-io-runtime"), feature = "tokio-runtime"))]
+        return self
+            .runtime
+            .spawn_blocking(write)
+            .await
+            .map_err(|err| IoError::other(format!("notification write task failed: {err}")))?;
+
+        #[cfg(all(not(feature = "tokio-runtime"), feature = "async-io-runtime"))]
+        task::spawn_blocking(write).await
     }
 }
 
@@ -830,6 +864,12 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         let sender = Arc::new(ResponseSender {
             failed: AtomicBool::new(false),
             connection: connection.clone(),
+            #[cfg(all(
+                target_os = "linux",
+                not(feature = "async-io-runtime"),
+                feature = "tokio-runtime"
+            ))]
+            runtime: tokio::runtime::Handle::current(),
         });
         self.response_sender.replace(sender.clone());
         self.tasks.replace(RequestTasks::new(connection));
