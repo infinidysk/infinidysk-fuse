@@ -24,7 +24,4 @@ updates:
     groups:
       github-actions:
         patterns: ["*"]
-    ignore:
-      # The ref selects the Rust toolchain (MSRV), not an action release.
-      - dependency-name: dtolnay/rust-toolchain
     open-pull-requests-limit: 10
