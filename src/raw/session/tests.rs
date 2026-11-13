@@ -3,6 +3,7 @@
 use std::ffi::OsStr;
 use std::io::{ErrorKind, Result as IoResult};
 use std::num::NonZeroU32;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -12,7 +13,7 @@ use tokio::sync::Notify as Signal;
 use tokio::task::JoinHandle;
 use tokio::time::{sleep, timeout};
 
-use super::Session;
+use super::{MountHandle, MountHandleInner, Session};
 use crate::notify::Notify;
 use crate::raw::abi::*;
 use crate::raw::connection::{FuseConnection, KernelSide};
@@ -38,6 +39,9 @@ const XATTR_DATA: &[u8] = b"abcd";
 #[derive(Debug, Default)]
 struct TestFs {
     destroyed: AtomicBool,
+    /// `init` fails with `EXDEV`.
+    fail_init: AtomicBool,
+    panic_in_ready: AtomicBool,
     copy_length: AtomicU64,
     notify: Mutex<Option<Notify>>,
     /// What `getattr` and `destroy` did, in order.
@@ -74,16 +78,27 @@ impl Drop for GetattrEnded<'_> {
 
 impl Filesystem for TestFs {
     async fn init(&self, _req: Request) -> Result<ReplyInit> {
+        if self.fail_init.load(Ordering::SeqCst) {
+            return Err(libc::EXDEV.into());
+        }
+
         Ok(ReplyInit::new(
             NonZeroU32::new(MAX_WRITE).expect("MAX_WRITE is a nonzero constant"),
         ))
     }
 
-    async fn ready(&self, notify: Notify) {
-        *self
-            .notify
-            .lock()
-            .expect("no test panics while holding the notify lock") = Some(notify);
+    // Not `async fn`, so the panic happens before a future exists.
+    fn ready(&self, notify: Notify) -> impl Future<Output = ()> + Send {
+        assert!(
+            !self.panic_in_ready.load(Ordering::SeqCst),
+            "ready panics to test ready panics"
+        );
+        async move {
+            *self
+                .notify
+                .lock()
+                .expect("no test panics while holding the notify lock") = Some(notify);
+        }
     }
 
     async fn destroy(&self, _req: Request) {
@@ -244,8 +259,12 @@ impl Harness {
     }
 
     fn start_with_grace(grace: Duration) -> Self {
+        Self::start_with(TestFs::default(), grace)
+    }
+
+    fn start_with(fs: TestFs, grace: Duration) -> Self {
         let (connection, kernel) = FuseConnection::memory();
-        let fs = Arc::new(TestFs::default());
+        let fs = Arc::new(fs);
 
         let mut session = Session::new(MountOptions::default());
         session.fuse_connection = Some(Arc::new(connection));
@@ -757,4 +776,146 @@ async fn handler_panic_ends_session_after_destroy() {
         .expect_err("a handler panic ends the session");
     assert_eq!(err.kind(), ErrorKind::Other, "{err}");
     assert!(harness.fs.destroyed.load(Ordering::SeqCst));
+}
+
+async fn session_error(harness: Harness) -> (std::io::Error, Arc<TestFs>) {
+    let err = timeout(WAIT, harness.session)
+        .await
+        .expect("session ends within the timeout")
+        .expect("session task does not panic")
+        .expect_err("the session ends with an error");
+    (err, harness.fs)
+}
+
+#[tokio::test]
+async fn failed_backend_init_skips_destroy() {
+    let fs = TestFs::default();
+    fs.fail_init.store(true, Ordering::SeqCst);
+    let mut harness = Harness::start_with(fs, super::CALLBACK_GRACE);
+
+    let reply = harness.init(0).await;
+    assert_eq!(out_header(&reply), (FUSE_OUT_HEADER_SIZE, -libc::EXDEV, 1));
+
+    let (err, fs) = session_error(harness).await;
+    assert_eq!(err.raw_os_error(), Some(libc::EXDEV), "{err}");
+    assert!(!fs.destroyed.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn failed_init_reply_runs_destroy() {
+    let harness = Harness::start();
+
+    harness.kernel.fail_next_write(libc::EIO);
+    harness.send(fuse_opcode::FUSE_INIT as u32, 1, 0, &init_body(0));
+
+    let (err, fs) = session_error(harness).await;
+    assert_eq!(err.raw_os_error(), Some(libc::EIO), "{err}");
+    assert!(fs.destroyed.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn ready_panic_runs_destroy() {
+    let fs = TestFs::default();
+    fs.panic_in_ready.store(true, Ordering::SeqCst);
+    let mut harness = Harness::start_with(fs, super::CALLBACK_GRACE);
+
+    harness.init(0).await;
+
+    let (err, fs) = session_error(harness).await;
+    assert_eq!(err.kind(), ErrorKind::Other, "{err}");
+    assert!(fs.destroyed.load(Ordering::SeqCst));
+}
+
+/// Nothing is mounted here, so the OS unmount fails.
+const NOT_MOUNTED: &str = "/nonexistent/infinidysk-fuse-test";
+
+/// A [`MountHandle`] for a session on the in-memory connection at [`NOT_MOUNTED`].
+fn mount_handle(fs: TestFs) -> (MountHandle, KernelSide, Arc<TestFs>) {
+    let (connection, kernel) = FuseConnection::memory();
+    let fs = Arc::new(fs);
+
+    let mut session = Session::new(MountOptions::default());
+    session.fuse_connection = Some(Arc::new(connection));
+    session.filesystem = Some(fs.clone());
+
+    let handle = MountHandle {
+        inner: Some(MountHandleInner {
+            task: session.start(),
+            mount_path: PathBuf::from(NOT_MOUNTED),
+            destroy_notify: Arc::new(async_notify::Notify::new()),
+            #[cfg(any(
+                all(target_os = "linux", feature = "unprivileged"),
+                target_os = "macos"
+            ))]
+            unprivileged: false,
+        }),
+    };
+
+    (handle, kernel, fs)
+}
+
+fn send_init(kernel: &KernelSide) {
+    kernel
+        .requests
+        .send(Ok(request_frame(
+            fuse_opcode::FUSE_INIT as u32,
+            1,
+            0,
+            &init_body(0),
+        )))
+        .expect("the session holds the request receiver until it ends");
+}
+
+async fn init_reply(kernel: &mut KernelSide) -> Vec<u8> {
+    send_init(kernel);
+    timeout(WAIT, kernel.replies.recv())
+        .await
+        .expect("reply within the timeout")
+        .expect("the session holds the reply sender until it ends")
+}
+
+async fn failed_mount_handle() -> (MountHandle, KernelSide) {
+    let fs = TestFs::default();
+    fs.fail_init.store(true, Ordering::SeqCst);
+    let (handle, mut kernel, _fs) = mount_handle(fs);
+    init_reply(&mut kernel).await;
+    (handle, kernel)
+}
+
+#[tokio::test]
+async fn unmount_returns_the_session_error_over_the_unmount_error() {
+    let (handle, _kernel) = failed_mount_handle().await;
+
+    let err = timeout(WAIT, handle.unmount())
+        .await
+        .expect("unmount within the timeout")
+        .expect_err("the session failed");
+    assert_eq!(err.raw_os_error(), Some(libc::EXDEV), "{err}");
+}
+
+#[tokio::test]
+async fn unmount_after_the_handle_returned_still_unmounts() {
+    let (mut handle, _kernel) = failed_mount_handle().await;
+
+    let err = timeout(WAIT, &mut handle)
+        .await
+        .expect("session ends within the timeout")
+        .expect_err("the session failed");
+    assert_eq!(err.raw_os_error(), Some(libc::EXDEV), "{err}");
+
+    let err = timeout(WAIT, handle.unmount())
+        .await
+        .expect("unmount within the timeout")
+        .expect_err("nothing is mounted at the path");
+    assert_ne!(err.raw_os_error(), Some(libc::EXDEV), "{err}");
+}
+
+#[tokio::test]
+async fn dropping_the_handle_off_the_runtime_does_not_panic() {
+    let (handle, mut kernel, _fs) = mount_handle(TestFs::default());
+    init_reply(&mut kernel).await;
+
+    std::thread::spawn(move || drop(handle))
+        .join()
+        .expect("dropping the handle does not panic");
 }
