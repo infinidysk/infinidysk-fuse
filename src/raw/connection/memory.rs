@@ -15,6 +15,7 @@ use crate::raw::abi::FUSE_IN_HEADER_SIZE;
 #[derive(Debug)]
 enum ScriptedWrite {
     Fail(i32),
+    Short(usize),
     #[cfg(target_os = "linux")]
     Gate(gate::GatedWrite),
 }
@@ -114,6 +115,10 @@ impl KernelSide {
         self.script(ScriptedWrite::Fail(errno));
     }
 
+    pub(crate) fn short_next_write(&self, written: usize) {
+        self.script(ScriptedWrite::Short(written));
+    }
+
     /// The next write blocks its thread until the gate is released, then succeeds.
     #[cfg(target_os = "linux")]
     pub(crate) fn gate_next_write(&self) -> gate::WriteGate {
@@ -177,6 +182,7 @@ impl MemoryConnection {
             .pop_front();
         match scripted {
             Some(ScriptedWrite::Fail(errno)) => return Err(io::Error::from_raw_os_error(errno)),
+            Some(ScriptedWrite::Short(written)) => return Ok(written),
 
             #[cfg(target_os = "linux")]
             Some(ScriptedWrite::Gate(gate)) => gate.wait(),

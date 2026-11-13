@@ -192,6 +192,26 @@ impl Notify {
             .await;
     }
 
+    /// Invalidate an inode and report whether the kernel accepted the notification.
+    pub async fn try_invalid_inode(self, inode: u64, offset: i64, len: i64) -> std::io::Result<()> {
+        let header = fuse_out_header {
+            len: (FUSE_OUT_HEADER_SIZE + FUSE_NOTIFY_INVAL_INODE_OUT_SIZE) as u32,
+            error: fuse_notify_code::FUSE_NOTIFY_INVAL_INODE as i32,
+            unique: 0,
+        };
+        let body = fuse_notify_inval_inode_out {
+            ino: inode,
+            off: offset,
+            len,
+        };
+        self.sender
+            .try_send_notification(&[
+                IoSlice::new(header.as_bytes()),
+                IoSlice::new(body.as_bytes()),
+            ])
+            .await
+    }
+
     /// try to notify the invalidation about a directory entry.
     pub async fn invalid_entry(mut self, parent: u64, name: OsString) {
         self.notify(NotifyKind::InvalidEntry { parent, name }).await;
