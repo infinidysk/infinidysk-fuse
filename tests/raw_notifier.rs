@@ -158,7 +158,9 @@ async fn invalidate_cached_data_without_poll() {
         );
         // No poll implementation and no lock held while notifying the kernel.
         let notify = state.notifier.lock().unwrap().clone().unwrap();
-        tokio::runtime::Handle::current().block_on(notify.invalid_inode(2, 0, 0));
+        tokio::runtime::Handle::current()
+            .block_on(notify.try_invalid_inode(2, 0, 0))
+            .unwrap();
         file.seek(SeekFrom::Start(0)).unwrap();
         file.read_exact(&mut bytes).unwrap();
         assert_eq!(&bytes, b"after!");

@@ -33,6 +33,14 @@ The crate is imported as `infinidysk_fuse`.
 The two runtime features are mutually exclusive. The crate does not build
 with neither.
 
+## Checked cache invalidation
+
+The notifier passed to `Filesystem::ready` supports
+`notify.try_invalid_inode(inode, offset, len).await`. It returns an I/O result
+after the kernel write finishes, so callers can wait before exposing changed
+file bytes. An incomplete write or rejected notification returns an error.
+The existing `invalid_inode` method continues to log errors without returning them.
+
 ## Quick start
 
 Implement `raw::Filesystem` (inode-based) or `path::PathFilesystem`
