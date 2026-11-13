@@ -765,6 +765,73 @@ async fn failed_notification_write_ends_session() {
     assert!(harness.fs.destroyed.load(Ordering::SeqCst));
 }
 
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn rejected_reply_is_answered_with_eio() {
+    let lookup = fuse_opcode::FUSE_LOOKUP as u32;
+    let mut harness = Harness::start();
+    harness.init(0).await;
+
+    harness.kernel.fail_next_write(libc::EINVAL);
+    harness.send(UNKNOWN_OPCODE, 2, ROOT, &[]);
+    let reply = harness.reply().await;
+    assert_eq!(out_header(&reply), (FUSE_OUT_HEADER_SIZE, -libc::EIO, 2));
+
+    harness.send(lookup, 3, ROOT, b"hello\0");
+    let reply = harness.reply().await;
+    assert_eq!(out_header(&reply), (reply.len(), 0, 3));
+
+    harness.finish().await;
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn reply_rejected_after_completion_keeps_session() {
+    let lookup = fuse_opcode::FUSE_LOOKUP as u32;
+    let mut harness = Harness::start();
+    harness.init(0).await;
+
+    harness.kernel.fail_next_write(libc::EINVAL);
+    harness.kernel.fail_next_write(libc::ENOENT);
+    // The serve loop replies to an unknown opcode before it reads the next request.
+    harness.send(UNKNOWN_OPCODE, 2, ROOT, &[]);
+
+    harness.send(lookup, 3, ROOT, b"hello\0");
+    let reply = harness.reply().await;
+    assert_eq!(out_header(&reply), (reply.len(), 0, 3));
+
+    harness.finish().await;
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn failed_reply_fallback_ends_session() {
+    let mut harness = Harness::start();
+    harness.init(0).await;
+
+    harness.kernel.fail_next_write(libc::EINVAL);
+    harness.kernel.fail_next_write(libc::ENODEV);
+    harness.send(fuse_opcode::FUSE_LOOKUP as u32, 2, ROOT, b"hello\0");
+
+    let (err, fs) = session_error(harness).await;
+    assert_eq!(err.kind(), ErrorKind::Other, "{err}");
+    assert!(fs.destroyed.load(Ordering::SeqCst));
+}
+
+#[cfg(not(target_os = "linux"))]
+#[tokio::test]
+async fn rejected_reply_ends_session() {
+    let mut harness = Harness::start();
+    harness.init(0).await;
+
+    harness.kernel.fail_next_write(libc::EINVAL);
+    harness.send(fuse_opcode::FUSE_LOOKUP as u32, 2, ROOT, b"hello\0");
+
+    let (err, fs) = session_error(harness).await;
+    assert_eq!(err.kind(), ErrorKind::Other, "{err}");
+    assert!(fs.destroyed.load(Ordering::SeqCst));
+}
+
 /// Inits the session and leaves a GETATTR (unique 2) waiting in `getattr`.
 async fn start_with_getattr_waiting(grace: Duration) -> Harness {
     let mut harness = Harness::start_with_grace(grace);
