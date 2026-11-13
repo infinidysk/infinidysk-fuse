@@ -378,7 +378,7 @@ dependencies = [
 
 [[package]]
 name = "infinidysk-fuse"
-version = "0.10.0"
+version = "0.10.1"
 dependencies = [
  "async-fs",
  "async-global-executor",
@@ -401,7 +401,7 @@ dependencies = [
 
 [[package]]
 name = "infinidysk-fuse-examples"
-version = "0.1.0"
+version = "0.10.1"
 dependencies = [
  "bytes",
  "futures-util",
