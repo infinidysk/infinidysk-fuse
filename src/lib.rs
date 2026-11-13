@@ -20,6 +20,13 @@
 
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
+#[cfg(all(feature = "tokio-runtime", feature = "async-io-runtime"))]
+compile_error!(
+    "features `tokio-runtime` and `async-io-runtime` are mutually exclusive; enable exactly one"
+);
+#[cfg(not(any(feature = "tokio-runtime", feature = "async-io-runtime")))]
+compile_error!("enable exactly one of the features `tokio-runtime` or `async-io-runtime`");
+
 #[cfg(target_os = "macos")]
 use std::io::ErrorKind;
 #[cfg(any(
