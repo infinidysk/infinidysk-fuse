@@ -292,6 +292,13 @@ impl Harness {
             .expect("the session holds the request receiver until it ends");
     }
 
+    fn send_read_error(&self, errno: i32) {
+        self.kernel
+            .requests
+            .send(Err(std::io::Error::from_raw_os_error(errno)))
+            .expect("the session holds the request receiver until it ends");
+    }
+
     async fn reply(&mut self) -> Vec<u8> {
         timeout(WAIT, self.kernel.replies.recv())
             .await
@@ -624,20 +631,82 @@ async fn malformed_init_frame_ends_session() {
 }
 
 #[tokio::test]
-async fn malformed_frame_is_not_dispatched() {
+async fn malformed_frame_ends_session() {
     let lookup = fuse_opcode::FUSE_LOOKUP as u32;
+
+    for (case, frame) in malformed_frames(lookup, 2, ROOT, b"hello\0") {
+        let mut harness = Harness::start();
+        harness.init(0).await;
+        harness.send_frame(frame);
+
+        let Harness {
+            mut kernel,
+            session,
+            fs,
+        } = harness;
+        let err = timeout(WAIT, session)
+            .await
+            .expect("session ends within the timeout")
+            .expect("session task does not panic")
+            .expect_err(case);
+
+        assert_eq!(err.kind(), ErrorKind::InvalidData, "{case}: {err}");
+        assert!(kernel.replies.try_recv().is_err(), "{case}: got a reply");
+        assert!(fs.destroyed.load(Ordering::SeqCst), "{case}");
+    }
+}
+
+#[tokio::test]
+async fn transient_read_errors_are_retried() {
     let mut harness = Harness::start();
+    for errno in [libc::EINTR, libc::EAGAIN, libc::ENOENT] {
+        harness.send_read_error(errno);
+    }
     harness.init(0).await;
 
-    for (_, frame) in malformed_frames(lookup, 2, ROOT, b"hello\0") {
-        harness.send_frame(frame);
+    for errno in [libc::EINTR, libc::EAGAIN, libc::ENOENT] {
+        harness.send_read_error(errno);
     }
-
-    harness.send(lookup, 10, ROOT, b"hello\0");
+    harness.send(fuse_opcode::FUSE_LOOKUP as u32, 2, ROOT, b"hello\0");
     let reply = harness.reply().await;
-    assert_eq!(out_header(&reply), (reply.len(), 0, 10));
+    assert_eq!(out_header(&reply), (reply.len(), 0, 2));
 
     harness.finish().await;
+}
+
+#[tokio::test]
+async fn connection_abort_ends_session_cleanly() {
+    let mut harness = Harness::start();
+    harness.init(0).await;
+    harness.send_read_error(libc::ECONNABORTED);
+
+    timeout(WAIT, harness.session)
+        .await
+        .expect("session ends within the timeout")
+        .expect("session task does not panic")
+        .expect("an aborted connection ends the session without an error");
+    assert!(harness.fs.destroyed.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn persistent_read_error_ends_session() {
+    let mut harness = Harness::start();
+    harness.init(0).await;
+    harness.send_read_error(libc::EIO);
+
+    let (err, fs) = session_error(harness).await;
+    assert_eq!(err.raw_os_error(), Some(libc::EIO), "{err}");
+    assert!(fs.destroyed.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn read_error_before_init_ends_session() {
+    let harness = Harness::start();
+    harness.send_read_error(libc::EIO);
+
+    let (err, fs) = session_error(harness).await;
+    assert_eq!(err.raw_os_error(), Some(libc::EIO), "{err}");
+    assert!(!fs.destroyed.load(Ordering::SeqCst));
 }
 
 /// Inits the session and returns the notifier the filesystem got in `ready`.

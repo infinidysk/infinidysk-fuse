@@ -892,39 +892,54 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         mut header_buffer: Vec<u8>,
         mut data_buffer: Vec<u8>,
     ) -> ReadResult {
-        let res = match fuse_connection
-            .read_vectored(header_buffer, data_buffer)
-            .await
-        {
-            None => return ReadResult::Destroy,
+        let n = loop {
+            let res = match fuse_connection
+                .read_vectored(header_buffer, data_buffer)
+                .await
+            {
+                None => return ReadResult::Destroy,
 
-            Some(((header_buf, data_buf), res)) => {
-                header_buffer = header_buf;
-                data_buffer = data_buf;
+                Some(((header_buf, data_buf), res)) => {
+                    header_buffer = header_buf;
+                    data_buffer = data_buf;
 
-                res
-            }
-        };
-        let n = match res {
-            Err(err) => {
-                if let Some(errno) = err.raw_os_error()
-                    && errno == libc::ENODEV
+                    res
+                }
+            };
+
+            match res {
+                Ok(n) => break n,
+
+                // libfuse 3.16.2 retries these too; ENOENT is a request interrupted before it was read.
+                Err(err)
+                    if matches!(
+                        err.raw_os_error(),
+                        Some(libc::EINTR | libc::EAGAIN | libc::ENOENT)
+                    ) =>
                 {
-                    debug!("read from /dev/fuse failed with ENODEV");
+                    debug!(%err, "retrying /dev/fuse read");
+                }
+
+                // Linux v6.12 fuse_dev_do_read returns ECONNABORTED for a request dequeued as the
+                // connection was aborted, which every unmount does.
+                Err(err)
+                    if matches!(err.raw_os_error(), Some(libc::ENODEV | libc::ECONNABORTED)) =>
+                {
+                    debug!(%err, "fuse connection closed");
 
                     return ReadResult::Destroy;
                 }
 
-                error!("read from /dev/fuse failed {}", err);
+                Err(err) => {
+                    error!(%err, "read from /dev/fuse failed");
 
-                return ReadResult::Request {
-                    in_header: Err(err),
-                    header_buffer,
-                    data_buffer,
-                };
+                    return ReadResult::Request {
+                        in_header: Err(err),
+                        header_buffer,
+                        data_buffer,
+                    };
+                }
             }
-
-            Ok(n) => n,
         };
 
         debug!(n, "read fuse request done");
@@ -1047,8 +1062,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                     data_buffer = data_buf;
 
                     match in_header {
-                        // ponytail: a bad frame is dropped unanswered until read errors get a retry policy.
-                        Err(_) => continue,
+                        Err(err) => return (Request::default(), Err(err)),
 
                         Ok(in_header) => in_header,
                     }
