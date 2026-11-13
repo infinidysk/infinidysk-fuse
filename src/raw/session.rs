@@ -689,7 +689,8 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             );
 
             return ReadResult::Request {
-                in_header: Err(IoError::other(
+                in_header: Err(IoError::new(
+                    ErrorKind::InvalidData,
                     "read_vectored n is less then FUSE_IN_HEADER_SIZE",
                 )),
                 header_buffer,
@@ -710,6 +711,25 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
 
             Ok(in_header) => in_header,
         };
+
+        // Dispatch slices the payload by `len`, so it must be exactly what was read.
+        if in_header.len as usize != n {
+            error!(
+                n,
+                len = in_header.len,
+                unique = in_header.unique,
+                "fuse_in_header len does not match the bytes read"
+            );
+
+            return ReadResult::Request {
+                in_header: Err(IoError::new(
+                    ErrorKind::InvalidData,
+                    "fuse_in_header len does not match the bytes read",
+                )),
+                header_buffer,
+                data_buffer,
+            };
+        }
 
         ReadResult::Request {
             in_header: Ok(in_header),
@@ -754,6 +774,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                     data_buffer = data_buf;
 
                     match in_header {
+                        // ponytail: a bad frame is dropped unanswered; ending the session waits for cleanup on session errors (#15).
                         Err(_) => continue,
 
                         Ok(in_header) => in_header,

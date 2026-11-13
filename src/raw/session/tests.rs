@@ -1,7 +1,7 @@
 //! Dispatcher tests over the in-memory connection. No mount, no `/dev/fuse`.
 
 use std::ffi::OsStr;
-use std::io::Result as IoResult;
+use std::io::{ErrorKind, Result as IoResult};
 use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -197,6 +197,13 @@ impl Harness {
             .expect("the session holds the request receiver until it ends");
     }
 
+    fn send_frame(&self, frame: Vec<u8>) {
+        self.kernel
+            .requests
+            .send(Ok(frame))
+            .expect("the session holds the request receiver until it ends");
+    }
+
     async fn reply(&mut self) -> Vec<u8> {
         timeout(WAIT, self.kernel.replies.recv())
             .await
@@ -205,17 +212,12 @@ impl Harness {
     }
 
     async fn init(&mut self, offered_flags: u32) -> Vec<u8> {
-        let mut body = Vec::new();
-        for field in [
-            FUSE_KERNEL_VERSION,
-            FUSE_KERNEL_MINOR_VERSION,
-            MAX_READAHEAD,
-            offered_flags,
-        ] {
-            body.extend_from_slice(&field.to_ne_bytes());
-        }
-
-        self.send(fuse_opcode::FUSE_INIT as u32, 1, 0, &body);
+        self.send(
+            fuse_opcode::FUSE_INIT as u32,
+            1,
+            0,
+            &init_body(offered_flags),
+        );
         self.reply().await
     }
 
@@ -466,6 +468,86 @@ async fn invalid_xattr_reply_is_eio() {
     assert_eq!(reply.len(), FUSE_OUT_HEADER_SIZE + FUSE_GETXATTR_OUT_SIZE);
     assert_eq!(out_header(&reply), (reply.len(), 0, 21));
     assert_eq!(u32_at(&reply, FUSE_OUT_HEADER_SIZE), data_len);
+
+    harness.finish().await;
+}
+
+fn init_body(offered_flags: u32) -> Vec<u8> {
+    let mut body = Vec::new();
+    for field in [
+        FUSE_KERNEL_VERSION,
+        FUSE_KERNEL_MINOR_VERSION,
+        MAX_READAHEAD,
+        offered_flags,
+    ] {
+        body.extend_from_slice(&field.to_ne_bytes());
+    }
+    body
+}
+
+/// Frames whose header `len` disagrees with the bytes delivered, plus one shorter than a header.
+fn malformed_frames(
+    opcode: u32,
+    unique: u64,
+    nodeid: u64,
+    body: &[u8],
+) -> Vec<(&'static str, Vec<u8>)> {
+    let frame = request_frame(opcode, unique, nodeid, body);
+    let with_len = |len: usize| {
+        let mut frame = frame.clone();
+        let len = u32::try_from(len).expect("test frames are small");
+        frame[..4].copy_from_slice(&len.to_ne_bytes());
+        frame
+    };
+
+    vec![
+        ("short header", frame[..FUSE_IN_HEADER_SIZE - 1].to_vec()),
+        ("len below header size", with_len(FUSE_IN_HEADER_SIZE - 1)),
+        ("len below bytes read", with_len(frame.len() - 1)),
+        ("len above bytes read", with_len(frame.len() + 8)),
+    ]
+}
+
+#[tokio::test]
+async fn malformed_init_frame_ends_session() {
+    let init = fuse_opcode::FUSE_INIT as u32;
+
+    for (case, frame) in malformed_frames(init, 1, 0, &init_body(0)) {
+        let Harness {
+            mut kernel,
+            session,
+            fs,
+        } = Harness::start();
+        kernel
+            .requests
+            .send(Ok(frame))
+            .expect("the session holds the request receiver until it ends");
+
+        let err = timeout(WAIT, session)
+            .await
+            .expect("session ends within the timeout")
+            .expect("session task does not panic")
+            .expect_err(case);
+
+        assert_eq!(err.kind(), ErrorKind::InvalidData, "{case}: {err}");
+        assert!(kernel.replies.try_recv().is_err(), "{case}: got a reply");
+        assert!(!fs.destroyed.load(Ordering::SeqCst), "{case}");
+    }
+}
+
+#[tokio::test]
+async fn malformed_frame_is_not_dispatched() {
+    let lookup = fuse_opcode::FUSE_LOOKUP as u32;
+    let mut harness = Harness::start();
+    harness.init(0).await;
+
+    for (_, frame) in malformed_frames(lookup, 2, ROOT, b"hello\0") {
+        harness.send_frame(frame);
+    }
+
+    harness.send(lookup, 10, ROOT, b"hello\0");
+    let reply = harness.reply().await;
+    assert_eq!(out_header(&reply), (reply.len(), 0, 10));
 
     harness.finish().await;
 }
