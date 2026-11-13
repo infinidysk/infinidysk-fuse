@@ -4,6 +4,7 @@ use std::ffi::OsStr;
 use std::io::{ErrorKind, Result as IoResult};
 use std::num::NonZeroU32;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -11,6 +12,7 @@ use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
 use super::Session;
+use crate::notify::Notify;
 use crate::raw::abi::*;
 use crate::raw::connection::{FuseConnection, KernelSide};
 use crate::raw::filesystem::Filesystem;
@@ -34,6 +36,7 @@ const XATTR_DATA: &[u8] = b"abcd";
 struct TestFs {
     destroyed: AtomicBool,
     copy_length: AtomicU64,
+    notify: Mutex<Option<Notify>>,
 }
 
 impl Filesystem for TestFs {
@@ -41,6 +44,13 @@ impl Filesystem for TestFs {
         Ok(ReplyInit::new(
             NonZeroU32::new(MAX_WRITE).expect("MAX_WRITE is a nonzero constant"),
         ))
+    }
+
+    async fn ready(&self, notify: Notify) {
+        *self
+            .notify
+            .lock()
+            .expect("no test panics while holding the notify lock") = Some(notify);
     }
 
     async fn destroy(&self, _req: Request) {
@@ -550,4 +560,59 @@ async fn malformed_frame_is_not_dispatched() {
     assert_eq!(out_header(&reply), (reply.len(), 0, 10));
 
     harness.finish().await;
+}
+
+/// Inits the session and returns the notifier the filesystem got in `ready`.
+async fn ready_notify(harness: &mut Harness) -> Notify {
+    harness.init(0).await;
+    // Dispatch starts after `ready` returns, so any reply proves `ready` ran.
+    harness.send(fuse_opcode::FUSE_LOOKUP as u32, 2, ROOT, b"hello\0");
+    harness.reply().await;
+
+    harness
+        .fs
+        .notify
+        .lock()
+        .expect("no test panics while holding the notify lock")
+        .clone()
+        .expect("ready stores the notifier")
+}
+
+#[tokio::test]
+async fn rejected_notification_keeps_session() {
+    // An errno the platform's kernel returns for a rejected notification without ending the connection.
+    #[cfg(target_os = "linux")]
+    let rejected = libc::ENOTEMPTY;
+    #[cfg(target_os = "freebsd")]
+    let rejected = libc::ENOSYS;
+    #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+    let rejected = libc::ENOENT;
+
+    let mut harness = Harness::start();
+    let notify = ready_notify(&mut harness).await;
+
+    harness.kernel.fail_next_write(rejected);
+    notify.invalid_entry(ROOT, "hello".into()).await;
+
+    harness.send(fuse_opcode::FUSE_LOOKUP as u32, 3, ROOT, b"hello\0");
+    let reply = harness.reply().await;
+    assert_eq!(out_header(&reply), (reply.len(), 0, 3));
+
+    harness.finish().await;
+}
+
+#[tokio::test]
+async fn failed_notification_write_ends_session() {
+    let mut harness = Harness::start();
+    let notify = ready_notify(&mut harness).await;
+
+    harness.kernel.fail_next_write(libc::EIO);
+    notify.invalid_entry(ROOT, "hello".into()).await;
+
+    let err = timeout(WAIT, harness.session)
+        .await
+        .expect("session ends within the timeout")
+        .expect("session task does not panic")
+        .expect_err("an unclassified notification error ends the session");
+    assert_eq!(err.kind(), ErrorKind::Other, "{err}");
 }

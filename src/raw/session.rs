@@ -159,6 +159,45 @@ impl ResponseSender {
         };
         self.send1(&out_header).await
     }
+
+    /// Send a notification in a single write. An error the kernel scopes to this notification
+    /// is logged; any other error ends the session, as for replies.
+    pub(crate) async fn send_notification(&self, bufs: &[IoSlice<'_>]) {
+        let Err(err) = self.connection.write_vectored(bufs).await else {
+            return;
+        };
+
+        if notification_rejected_locally(&err) {
+            warn!(%err, "kernel rejected a notification, the session continues");
+        } else {
+            error!(%err, "notification write failed");
+            self.send_failed.notify();
+        }
+    }
+}
+
+/// Whether a failed notification write left the connection usable.
+fn notification_rejected_locally(err: &IoError) -> bool {
+    // Linux v6.12 fuse_notify and fuse_reverse_inval_*: these fail only the notification.
+    #[cfg(target_os = "linux")]
+    const LOCAL: &[libc::c_int] = &[
+        libc::ENOENT,
+        libc::EINVAL,
+        libc::ENAMETOOLONG,
+        libc::ENOMEM,
+        libc::ENOTDIR,
+        libc::ENOTEMPTY,
+        libc::EBUSY,
+    ];
+    // FreeBSD 15 fuse_device_write: unimplemented notification codes do not kill the session.
+    #[cfg(target_os = "freebsd")]
+    const LOCAL: &[libc::c_int] = &[libc::ENOENT, libc::ENOSYS];
+    // ponytail: macFUSE notification errors are not verified; only ENOENT keeps the session, as before.
+    #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+    const LOCAL: &[libc::c_int] = &[libc::ENOENT];
+
+    err.raw_os_error()
+        .is_some_and(|errno| LOCAL.contains(&errno))
 }
 
 #[derive(Debug)]

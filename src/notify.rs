@@ -30,7 +30,7 @@ impl Notify {
     }
 
     /// notify kernel there are something need to handle. If notify failed, the error will be
-    /// logged and reported through the response sender.
+    /// logged; only errors that may have broken the connection end the session.
     async fn notify(&mut self, kind: NotifyKind) {
         match &kind {
             NotifyKind::Wakeup { kh } => {
@@ -42,7 +42,12 @@ impl Notify {
 
                 let wakeup_out = fuse_notify_poll_wakeup_out { kh: *kh };
 
-                self.sender.send2(&out_header, wakeup_out.as_bytes()).await;
+                self.sender
+                    .send_notification(&[
+                        IoSlice::new(out_header.as_bytes()),
+                        IoSlice::new(wakeup_out.as_bytes()),
+                    ])
+                    .await;
             }
 
             NotifyKind::InvalidInode { inode, offset, len } => {
@@ -59,7 +64,10 @@ impl Notify {
                 };
 
                 self.sender
-                    .send2(&out_header, invalid_inode_out.as_bytes())
+                    .send_notification(&[
+                        IoSlice::new(out_header.as_bytes()),
+                        IoSlice::new(invalid_inode_out.as_bytes()),
+                    ])
                     .await;
             }
 
@@ -78,7 +86,7 @@ impl Notify {
                 };
 
                 self.sender
-                    .send(&[
+                    .send_notification(&[
                         IoSlice::new(out_header.as_bytes()),
                         IoSlice::new(invalid_entry_out.as_bytes()),
                         IoSlice::new(name.as_bytes()),
@@ -107,7 +115,7 @@ impl Notify {
                 };
 
                 self.sender
-                    .send(&[
+                    .send_notification(&[
                         IoSlice::new(out_header.as_bytes()),
                         IoSlice::new(delete_out.as_bytes()),
                         IoSlice::new(name.as_bytes()),
@@ -135,7 +143,11 @@ impl Notify {
                 };
 
                 self.sender
-                    .send3(&out_header, store_out.as_bytes(), data)
+                    .send_notification(&[
+                        IoSlice::new(out_header.as_bytes()),
+                        IoSlice::new(store_out.as_bytes()),
+                        IoSlice::new(data),
+                    ])
                     .await;
             }
 
@@ -160,7 +172,10 @@ impl Notify {
                 };
 
                 self.sender
-                    .send2(&out_header, retrieve_out.as_bytes())
+                    .send_notification(&[
+                        IoSlice::new(out_header.as_bytes()),
+                        IoSlice::new(retrieve_out.as_bytes()),
+                    ])
                     .await;
             }
         };
