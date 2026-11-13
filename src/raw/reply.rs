@@ -347,8 +347,8 @@ impl From<ReplyCreated> for (fuse_entry_out, fuse_open_out) {
             generation: created.generation,
             entry_valid: created.ttl.as_secs(),
             attr_valid: created.ttl.as_secs(),
-            entry_valid_nsec: created.ttl.subsec_micros(),
-            attr_valid_nsec: created.ttl.subsec_micros(),
+            entry_valid_nsec: created.ttl.subsec_nanos(),
+            attr_valid_nsec: created.ttl.subsec_nanos(),
             attr: attr.into(),
         };
 
@@ -463,5 +463,47 @@ impl From<ReplyCopyFileRange> for fuse_write_out {
             size: copied.copied as u32,
             _padding: 0,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn create_reply_ttl_uses_nanoseconds() {
+        let time = Timestamp::new(0, 0);
+        let created = ReplyCreated {
+            ttl: Duration::from_millis(500),
+            attr: FileAttr {
+                ino: 2,
+                size: 0,
+                blocks: 0,
+                atime: time,
+                mtime: time,
+                ctime: time,
+                #[cfg(target_os = "macos")]
+                crtime: time,
+                kind: FileType::RegularFile,
+                perm: 0o644,
+                nlink: 1,
+                uid: 0,
+                gid: 0,
+                rdev: 0,
+                #[cfg(target_os = "macos")]
+                flags: 0,
+                blksize: 4096,
+            },
+            generation: 0,
+            fh: 1,
+            flags: 0,
+        };
+
+        let (entry_out, _) = <(fuse_entry_out, fuse_open_out)>::from(created);
+
+        assert_eq!(entry_out.entry_valid, 0);
+        assert_eq!(entry_out.attr_valid, 0);
+        assert_eq!(entry_out.entry_valid_nsec, 500_000_000);
+        assert_eq!(entry_out.attr_valid_nsec, 500_000_000);
     }
 }
