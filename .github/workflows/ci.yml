@@ -30,8 +30,72 @@ jobs:
       - name: Clippy (async-io-runtime)
         run: cargo clippy --all-targets --features=async-io-runtime,file-lock,unprivileged
 
+      - name: Test (tokio-runtime)
+        run: cargo test --locked -p infinidysk-fuse --lib --features=tokio-runtime,file-lock,unprivileged
+
+      - name: Test (async-io-runtime)
+        run: cargo test --locked -p infinidysk-fuse --lib --features=async-io-runtime,file-lock,unprivileged
+
+      - name: Check minimal feature sets
+        run: |
+          cargo check --locked -p infinidysk-fuse --lib --no-default-features --features=tokio-runtime
+          cargo check --locked -p infinidysk-fuse --lib --no-default-features --features=async-io-runtime
+
+      - name: Check invalid runtime selections fail clearly
+        env:
+          CARGO_TERM_COLOR: never
+        run: |
+          for features in tokio-runtime,async-io-runtime ""; do
+            if cargo check --locked -p infinidysk-fuse --lib --no-default-features --features="$features" 2> check.log; then
+              echo "features [$features] unexpectedly compiled"; exit 1
+            fi
+            grep -q 'error: .*exactly one' check.log || { cat check.log; exit 1; }
+          done
+
       - name: Doc
         run: cargo doc --features=file-lock,unprivileged,tokio-runtime
+
+  linux-mounted:
+    name: Linux mounted tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install FUSE
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fuse3
+          ls -l /dev/fuse
+          which fusermount3
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      # The mounted tests are Tokio-only today; fail if none of them ran.
+      - name: Mounted tests (tokio-runtime)
+        run: |
+          cargo test --locked -p infinidysk-fuse --test raw_notifier --features=tokio-runtime,file-lock,unprivileged -- --ignored 2>&1 | tee mounted.log
+          grep -qE 'test result: ok\. [1-9][0-9]* passed' mounted.log
+
+  msrv:
+    name: MSRV
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust 1.91
+        uses: dtolnay/rust-toolchain@1.91
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check
+        run: |
+          cargo check --locked -p infinidysk-fuse --lib --features=tokio-runtime,file-lock,unprivileged
+          cargo check --locked -p infinidysk-fuse --lib --features=async-io-runtime,file-lock,unprivileged
 
   macos:
     name: MacOS
@@ -52,6 +116,17 @@ jobs:
 
       - name: Clippy (async-io-runtime)
         run: cargo clippy --all-targets --features=async-io-runtime,file-lock,unprivileged
+
+      - name: Test (tokio-runtime)
+        run: cargo test --locked -p infinidysk-fuse --lib --features=tokio-runtime,file-lock,unprivileged
+
+      - name: Test (async-io-runtime)
+        run: cargo test --locked -p infinidysk-fuse --lib --features=async-io-runtime,file-lock,unprivileged
+
+      - name: Check minimal feature sets
+        run: |
+          cargo check --locked -p infinidysk-fuse --lib --no-default-features --features=tokio-runtime
+          cargo check --locked -p infinidysk-fuse --lib --no-default-features --features=async-io-runtime
 
       - name: Doc
         run: cargo doc --features=file-lock,unprivileged,tokio-runtime
@@ -76,6 +151,10 @@ jobs:
             rustup component add clippy
             cargo clippy --all-targets --features=tokio-runtime,file-lock,unprivileged
             cargo clippy --all-targets --features=async-io-runtime,file-lock,unprivileged
+            cargo test --locked -p infinidysk-fuse --lib --features=tokio-runtime,file-lock,unprivileged
+            cargo test --locked -p infinidysk-fuse --lib --features=async-io-runtime,file-lock,unprivileged
+            cargo check --locked -p infinidysk-fuse --lib --no-default-features --features=tokio-runtime
+            cargo check --locked -p infinidysk-fuse --lib --no-default-features --features=async-io-runtime
             cargo doc --features=file-lock,unprivileged,tokio-runtime
 
   minver:

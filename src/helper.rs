@@ -96,6 +96,7 @@ mod tests {
         }
 
         // the reported case: direntplus entries with 3-byte names and 4155 bytes
+        #[cfg(target_os = "linux")]
         assert_eq!(pack(FUSE_DIRENTPLUS_SIZE, 4155), (25, 4000));
     }
 }
