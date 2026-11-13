@@ -28,7 +28,7 @@ infinidysk-fuse = { path = "../", features = ["tokio-runtime", "unprivileged"] }
 libc = "0.2.183"
 tokio = { version = "1.50", features = ["macros", "rt", "time", "signal"] }
 futures-util = "0.3.32"
-mio = { version = "0.8.11", features = ["os-poll"] }
+mio = { version = "1.1.1", features = ["os-poll"] }
 tempfile = "3.27"
 bytes = "1.11.1"
 tracing = "0.1.44"
