@@ -44,6 +44,10 @@ version = "1.50"
 features = ["fs", "rt", "sync", "net", "macros", "process", "time"]
 optional = true
 
+# The macOS mount always receives the device descriptor over a socket.
+[target.'cfg(target_os = "macos")'.dependencies]
+nix = { version = "0.31.2", default-features = false, features = ["socket"] }
+
 [package.metadata.docs.rs]
 rustdoc-args = ["--cfg", "docsrs"]
 features = ["file-lock", "unprivileged", "tokio-runtime"]
