@@ -8,8 +8,9 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
+use tokio::sync::Notify as Signal;
 use tokio::task::JoinHandle;
-use tokio::time::timeout;
+use tokio::time::{sleep, timeout};
 
 use super::Session;
 use crate::notify::Notify;
@@ -18,7 +19,9 @@ use crate::raw::connection::{FuseConnection, KernelSide};
 use crate::raw::filesystem::Filesystem;
 #[cfg(feature = "file-lock")]
 use crate::raw::reply::ReplyLock;
-use crate::raw::reply::{FileAttr, ReplyCopyFileRange, ReplyEntry, ReplyInit, ReplyXAttr};
+use crate::raw::reply::{
+    FileAttr, ReplyAttr, ReplyCopyFileRange, ReplyData, ReplyEntry, ReplyInit, ReplyXAttr,
+};
 use crate::raw::request::Request;
 use crate::{FileType, Inode, MountOptions, Result, Timestamp};
 
@@ -37,6 +40,36 @@ struct TestFs {
     destroyed: AtomicBool,
     copy_length: AtomicU64,
     notify: Mutex<Option<Notify>>,
+    /// What `getattr` and `destroy` did, in order.
+    events: Mutex<Vec<&'static str>>,
+    /// `getattr` signals this on entry, then waits for `getattr_gate`.
+    getattr_entered: Signal,
+    getattr_gate: Signal,
+}
+
+impl TestFs {
+    fn record(&self, event: &'static str) {
+        self.events
+            .lock()
+            .expect("no test panics while holding the events lock")
+            .push(event);
+    }
+
+    fn events(&self) -> Vec<&'static str> {
+        self.events
+            .lock()
+            .expect("no test panics while holding the events lock")
+            .clone()
+    }
+}
+
+/// Records `getattr ended` when the `getattr` future completes or is dropped.
+struct GetattrEnded<'a>(&'a TestFs);
+
+impl Drop for GetattrEnded<'_> {
+    fn drop(&mut self) {
+        self.0.record("getattr ended");
+    }
 }
 
 impl Filesystem for TestFs {
@@ -54,7 +87,28 @@ impl Filesystem for TestFs {
     }
 
     async fn destroy(&self, _req: Request) {
+        self.record("destroy");
         self.destroyed.store(true, Ordering::SeqCst);
+    }
+
+    async fn getattr(
+        &self,
+        _req: Request,
+        _inode: Inode,
+        _fh: Option<u64>,
+        _flags: u32,
+    ) -> Result<ReplyAttr> {
+        let _ended = GetattrEnded(self);
+        self.record("getattr");
+        self.getattr_entered.notify_one();
+        self.getattr_gate.notified().await;
+        self.record("getattr done");
+
+        Err(libc::ENOENT.into())
+    }
+
+    async fn readlink(&self, _req: Request, _inode: Inode) -> Result<ReplyData> {
+        panic!("readlink panics to test handler panics");
     }
 
     async fn copy_file_range(
@@ -186,12 +240,17 @@ struct Harness {
 
 impl Harness {
     fn start() -> Self {
+        Self::start_with_grace(super::CALLBACK_GRACE)
+    }
+
+    fn start_with_grace(grace: Duration) -> Self {
         let (connection, kernel) = FuseConnection::memory();
         let fs = Arc::new(TestFs::default());
 
         let mut session = Session::new(MountOptions::default());
         session.fuse_connection = Some(Arc::new(connection));
         session.filesystem = Some(fs.clone());
+        session.callback_grace = grace;
 
         Self {
             kernel,
@@ -615,4 +674,87 @@ async fn failed_notification_write_ends_session() {
         .expect("session task does not panic")
         .expect_err("an unclassified notification error ends the session");
     assert_eq!(err.kind(), ErrorKind::Other, "{err}");
+    assert!(harness.fs.destroyed.load(Ordering::SeqCst));
+}
+
+/// Inits the session and leaves a GETATTR (unique 2) waiting in `getattr`.
+async fn start_with_getattr_waiting(grace: Duration) -> Harness {
+    let mut harness = Harness::start_with_grace(grace);
+    harness.init(0).await;
+
+    harness.send(fuse_opcode::FUSE_GETATTR as u32, 2, HELLO, &[0; 16]);
+    timeout(WAIT, harness.fs.getattr_entered.notified())
+        .await
+        .expect("getattr starts within the timeout");
+
+    harness
+}
+
+#[tokio::test]
+async fn destroy_waits_for_request_handlers() {
+    let Harness {
+        mut kernel,
+        session,
+        fs,
+    } = start_with_getattr_waiting(WAIT).await;
+
+    drop(kernel.requests);
+    sleep(Duration::from_millis(50)).await;
+    assert!(!session.is_finished(), "session ended with getattr running");
+    assert_eq!(fs.events(), ["getattr"]);
+
+    fs.getattr_gate.notify_one();
+    let reply = timeout(WAIT, kernel.replies.recv())
+        .await
+        .expect("reply within the timeout")
+        .expect("the session holds the reply sender until it ends");
+    assert_eq!(out_header(&reply), (FUSE_OUT_HEADER_SIZE, -libc::ENOENT, 2));
+
+    timeout(WAIT, session)
+        .await
+        .expect("session ends within the timeout")
+        .expect("session task does not panic")
+        .expect("session ends without an error");
+    assert_eq!(
+        fs.events(),
+        ["getattr", "getattr done", "getattr ended", "destroy"]
+    );
+}
+
+#[tokio::test]
+async fn handlers_past_the_grace_period_are_cancelled_before_destroy() {
+    let Harness {
+        mut kernel,
+        session,
+        fs,
+    } = start_with_getattr_waiting(Duration::from_millis(50)).await;
+
+    drop(kernel.requests);
+
+    timeout(WAIT, session)
+        .await
+        .expect("session ends within the timeout")
+        .expect("session task does not panic")
+        .expect("session ends without an error");
+    assert_eq!(fs.events(), ["getattr", "getattr ended", "destroy"]);
+    assert!(
+        kernel.replies.try_recv().is_err(),
+        "cancelled getattr replied"
+    );
+}
+
+#[tokio::test]
+async fn handler_panic_ends_session_after_destroy() {
+    let mut harness = Harness::start();
+    harness.init(0).await;
+
+    harness.send(fuse_opcode::FUSE_READLINK as u32, 2, HELLO, &[]);
+
+    let err = timeout(WAIT, harness.session)
+        .await
+        .expect("session ends within the timeout")
+        .expect("session task does not panic")
+        .expect_err("a handler panic ends the session");
+    assert_eq!(err.kind(), ErrorKind::Other, "{err}");
+    assert!(harness.fs.destroyed.load(Ordering::SeqCst));
 }

@@ -156,6 +156,11 @@ impl FuseConnection {
         )
     }
 
+    /// The current or next `read_vectored` returns `None`, which ends dispatch.
+    pub(crate) fn shut_down(&self) {
+        self.unmount_notify.notify();
+    }
+
     pub async fn read_vectored<T: DerefMut<Target = [u8]> + Send + 'static>(
         &self,
         header_buf: Vec<u8>,
