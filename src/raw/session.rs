@@ -4043,3 +4043,6 @@ where
     #[cfg(all(not(feature = "tokio-runtime"), feature = "async-io-runtime"))]
     task::spawn(fut.instrument(span)).detach()
 }
+
+#[cfg(test)]
+mod tests;

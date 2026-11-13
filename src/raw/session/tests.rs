@@ -1,0 +1,288 @@
+//! Dispatcher tests over the in-memory connection. No mount, no `/dev/fuse`.
+
+use std::ffi::OsStr;
+use std::io::Result as IoResult;
+use std::num::NonZeroU32;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+
+use tokio::task::JoinHandle;
+use tokio::time::timeout;
+
+use super::Session;
+use crate::raw::abi::*;
+use crate::raw::connection::{FuseConnection, KernelSide};
+use crate::raw::filesystem::Filesystem;
+#[cfg(feature = "file-lock")]
+use crate::raw::reply::ReplyLock;
+use crate::raw::reply::{FileAttr, ReplyEntry, ReplyInit};
+use crate::raw::request::Request;
+use crate::{FileType, Inode, MountOptions, Result, Timestamp};
+
+const MAX_WRITE: u32 = 16 * 1024;
+const MAX_READAHEAD: u32 = 128 * 1024;
+const ROOT: Inode = 1;
+const HELLO: Inode = 2;
+const UNKNOWN_OPCODE: u32 = 9999;
+const WAIT: Duration = Duration::from_secs(5);
+
+#[derive(Debug, Default)]
+struct TestFs {
+    destroyed: AtomicBool,
+}
+
+impl Filesystem for TestFs {
+    async fn init(&self, _req: Request) -> Result<ReplyInit> {
+        Ok(ReplyInit::new(
+            NonZeroU32::new(MAX_WRITE).expect("MAX_WRITE is a nonzero constant"),
+        ))
+    }
+
+    async fn destroy(&self, _req: Request) {
+        self.destroyed.store(true, Ordering::SeqCst);
+    }
+
+    async fn lookup(&self, _req: Request, parent: Inode, name: &OsStr) -> Result<ReplyEntry> {
+        if parent != ROOT || name != "hello" {
+            return Err(libc::ENOENT.into());
+        }
+
+        let time = Timestamp::new(0, 0);
+
+        Ok(ReplyEntry {
+            ttl: Duration::from_secs(1),
+            attr: FileAttr {
+                ino: HELLO,
+                size: 0,
+                blocks: 0,
+                atime: time,
+                mtime: time,
+                ctime: time,
+                #[cfg(target_os = "macos")]
+                crtime: time,
+                kind: FileType::RegularFile,
+                perm: 0o644,
+                nlink: 1,
+                uid: 0,
+                gid: 0,
+                rdev: 0,
+                #[cfg(target_os = "macos")]
+                flags: 0,
+                blksize: 4096,
+            },
+            generation: 0,
+        })
+    }
+
+    #[cfg(feature = "file-lock")]
+    async fn getlk(
+        &self,
+        _req: Request,
+        _inode: Inode,
+        _fh: u64,
+        _lock_owner: u64,
+        _start: u64,
+        _end: u64,
+        _type: u32,
+        _pid: u32,
+    ) -> Result<ReplyLock> {
+        Err(libc::ENOSYS.into())
+    }
+
+    #[cfg(feature = "file-lock")]
+    async fn setlk(
+        &self,
+        _req: Request,
+        _inode: Inode,
+        _fh: u64,
+        _lock_owner: u64,
+        _start: u64,
+        _end: u64,
+        _type: u32,
+        _pid: u32,
+        _block: bool,
+    ) -> Result<()> {
+        Err(libc::ENOSYS.into())
+    }
+}
+
+struct Harness {
+    kernel: KernelSide,
+    session: JoinHandle<IoResult<()>>,
+    fs: Arc<TestFs>,
+}
+
+impl Harness {
+    fn start() -> Self {
+        let (connection, kernel) = FuseConnection::memory();
+        let fs = Arc::new(TestFs::default());
+
+        let mut session = Session::new(MountOptions::default());
+        session.fuse_connection = Some(Arc::new(connection));
+        session.filesystem = Some(fs.clone());
+
+        Self {
+            kernel,
+            session: tokio::spawn(session.inner_mount()),
+            fs,
+        }
+    }
+
+    fn send(&self, opcode: u32, unique: u64, nodeid: u64, body: &[u8]) {
+        self.kernel
+            .requests
+            .send(Ok(request_frame(opcode, unique, nodeid, body)))
+            .expect("the session holds the request receiver until it ends");
+    }
+
+    async fn reply(&mut self) -> Vec<u8> {
+        timeout(WAIT, self.kernel.replies.recv())
+            .await
+            .expect("reply within the timeout")
+            .expect("the session holds the reply sender until it ends")
+    }
+
+    async fn init(&mut self, offered_flags: u32) -> Vec<u8> {
+        let mut body = Vec::new();
+        for field in [
+            FUSE_KERNEL_VERSION,
+            FUSE_KERNEL_MINOR_VERSION,
+            MAX_READAHEAD,
+            offered_flags,
+        ] {
+            body.extend_from_slice(&field.to_ne_bytes());
+        }
+
+        self.send(fuse_opcode::FUSE_INIT as u32, 1, 0, &body);
+        self.reply().await
+    }
+
+    /// Closes the device the way an unmount does and waits for the session to end.
+    async fn finish(self) -> Arc<TestFs> {
+        drop(self.kernel.requests);
+
+        timeout(WAIT, self.session)
+            .await
+            .expect("session ends within the timeout")
+            .expect("session task does not panic")
+            .expect("session ends without an error");
+
+        self.fs
+    }
+}
+
+fn request_frame(opcode: u32, unique: u64, nodeid: u64, body: &[u8]) -> Vec<u8> {
+    let len = u32::try_from(FUSE_IN_HEADER_SIZE + body.len()).expect("test frames are small");
+
+    let mut frame = Vec::with_capacity(FUSE_IN_HEADER_SIZE + body.len());
+    frame.extend_from_slice(&len.to_ne_bytes());
+    frame.extend_from_slice(&opcode.to_ne_bytes());
+    frame.extend_from_slice(&unique.to_ne_bytes());
+    frame.extend_from_slice(&nodeid.to_ne_bytes());
+    // uid, gid, pid, padding
+    frame.extend_from_slice(&[0; 16]);
+    frame.extend_from_slice(body);
+
+    assert_eq!(frame.len(), len as usize);
+    frame
+}
+
+fn u32_at(frame: &[u8], offset: usize) -> u32 {
+    u32::from_ne_bytes(
+        frame[offset..offset + 4]
+            .try_into()
+            .expect("slice is 4 bytes"),
+    )
+}
+
+fn u64_at(frame: &[u8], offset: usize) -> u64 {
+    u64::from_ne_bytes(
+        frame[offset..offset + 8]
+            .try_into()
+            .expect("slice is 8 bytes"),
+    )
+}
+
+/// `(len, error, unique)` from a `fuse_out_header`.
+fn out_header(reply: &[u8]) -> (usize, i32, u64) {
+    assert!(
+        reply.len() >= FUSE_OUT_HEADER_SIZE,
+        "reply shorter than its header"
+    );
+
+    (
+        u32_at(reply, 0) as usize,
+        u32_at(reply, 4) as i32,
+        u64_at(reply, 8),
+    )
+}
+
+#[tokio::test]
+async fn init_replies_with_negotiated_parameters() {
+    let mut harness = Harness::start();
+    let offered = FUSE_ASYNC_READ | FUSE_BIG_WRITES;
+
+    let reply = harness.init(offered).await;
+
+    assert_eq!(reply.len(), FUSE_OUT_HEADER_SIZE + FUSE_INIT_OUT_SIZE);
+    assert_eq!(out_header(&reply), (reply.len(), 0, 1));
+
+    let init_out = &reply[FUSE_OUT_HEADER_SIZE..];
+    assert_eq!(u32_at(init_out, 0), FUSE_KERNEL_VERSION);
+    assert_eq!(u32_at(init_out, 4), FUSE_KERNEL_MINOR_VERSION);
+    assert_eq!(u32_at(init_out, 8), MAX_READAHEAD);
+    let flags = u32_at(init_out, 12);
+    assert_eq!(
+        flags & !offered,
+        0,
+        "replied flags {flags:#x} were not offered"
+    );
+    assert_ne!(flags & FUSE_ASYNC_READ, 0);
+    assert_eq!(u32_at(init_out, 20), MAX_WRITE);
+
+    let fs = harness.finish().await;
+    assert!(fs.destroyed.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn lookup_replies_with_entry_or_errno() {
+    let mut harness = Harness::start();
+    harness.init(0).await;
+
+    harness.send(fuse_opcode::FUSE_LOOKUP as u32, 2, ROOT, b"hello\0");
+    harness.send(fuse_opcode::FUSE_LOOKUP as u32, 3, ROOT, b"missing\0");
+
+    // Handlers run concurrently, so match replies by unique.
+    let mut replies = [harness.reply().await, harness.reply().await];
+    replies.sort_by_key(|reply| out_header(reply).2);
+    let [found, missing] = replies;
+
+    assert_eq!(found.len(), FUSE_OUT_HEADER_SIZE + FUSE_ENTRY_OUT_SIZE);
+    assert_eq!(out_header(&found), (found.len(), 0, 2));
+    assert_eq!(u64_at(&found, FUSE_OUT_HEADER_SIZE), HELLO);
+
+    assert_eq!(
+        out_header(&missing),
+        (FUSE_OUT_HEADER_SIZE, -libc::ENOENT, 3)
+    );
+
+    harness.finish().await;
+}
+
+#[tokio::test]
+async fn unknown_opcode_gets_enosys_and_dispatch_continues() {
+    let mut harness = Harness::start();
+    harness.init(0).await;
+
+    harness.send(UNKNOWN_OPCODE, 4, ROOT, &[]);
+    assert_eq!(
+        out_header(&harness.reply().await),
+        (FUSE_OUT_HEADER_SIZE, -libc::ENOSYS, 4)
+    );
+
+    harness.send(fuse_opcode::FUSE_LOOKUP as u32, 5, ROOT, b"hello\0");
+    assert_eq!(out_header(&harness.reply().await).1, 0);
+
+    harness.finish().await;
+}

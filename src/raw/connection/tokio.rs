@@ -143,6 +143,19 @@ impl FuseConnection {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn memory() -> (Self, super::KernelSide) {
+        let (connection, kernel) = super::memory::MemoryConnection::new();
+
+        (
+            Self {
+                unmount_notify: Arc::new(Notify::new()),
+                mode: ConnectionMode::Memory(connection),
+            },
+            kernel,
+        )
+    }
+
     pub async fn read_vectored<T: DerefMut<Target = [u8]> + Send + 'static>(
         &self,
         header_buf: Vec<u8>,
@@ -174,6 +187,10 @@ impl FuseConnection {
             ConnectionMode::NonBlock(connection) => {
                 connection.read_vectored(header_buf, data_buf).await
             }
+            #[cfg(test)]
+            ConnectionMode::Memory(connection) => {
+                connection.read_vectored(header_buf, data_buf).await
+            }
         }
     }
 
@@ -186,6 +203,8 @@ impl FuseConnection {
                 target_os = "freebsd",
             ))]
             ConnectionMode::NonBlock(connection) => connection.write_vectored(bufs).await,
+            #[cfg(test)]
+            ConnectionMode::Memory(connection) => connection.write_vectored(bufs),
         }
     }
 }
@@ -199,6 +218,8 @@ enum ConnectionMode {
         target_os = "freebsd",
     ))]
     NonBlock(NonBlockFuseConnection),
+    #[cfg(test)]
+    Memory(super::memory::MemoryConnection),
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -558,6 +579,9 @@ impl AsFd for FuseConnection {
                 target_os = "freebsd",
             ))]
             ConnectionMode::NonBlock(connection) => connection.fd.as_fd(),
+
+            #[cfg(test)]
+            ConnectionMode::Memory(_) => unreachable!("only mount code asks for the device fd"),
         }
     }
 }
