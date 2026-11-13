@@ -1,5 +1,5 @@
 [package]
-name = "examples"
+name = "infinidysk-fuse-examples"
 version = "0.1.0"
 authors = ["Sherlock Holo <sherlockya@gmail.com>"]
 edition = "2021"
