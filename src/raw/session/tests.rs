@@ -4,7 +4,7 @@ use std::ffi::OsStr;
 use std::io::Result as IoResult;
 use std::num::NonZeroU32;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use tokio::task::JoinHandle;
@@ -16,7 +16,7 @@ use crate::raw::connection::{FuseConnection, KernelSide};
 use crate::raw::filesystem::Filesystem;
 #[cfg(feature = "file-lock")]
 use crate::raw::reply::ReplyLock;
-use crate::raw::reply::{FileAttr, ReplyEntry, ReplyInit};
+use crate::raw::reply::{FileAttr, ReplyCopyFileRange, ReplyEntry, ReplyInit};
 use crate::raw::request::Request;
 use crate::{FileType, Inode, MountOptions, Result, Timestamp};
 
@@ -25,11 +25,14 @@ const MAX_READAHEAD: u32 = 128 * 1024;
 const ROOT: Inode = 1;
 const HELLO: Inode = 2;
 const UNKNOWN_OPCODE: u32 = 9999;
+/// `copy_file_range` reports one byte more than it was asked to copy for this input handle.
+const OVERREPORTING_FH: u64 = 2;
 const WAIT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Default)]
 struct TestFs {
     destroyed: AtomicBool,
+    copy_length: AtomicU64,
 }
 
 impl Filesystem for TestFs {
@@ -41,6 +44,29 @@ impl Filesystem for TestFs {
 
     async fn destroy(&self, _req: Request) {
         self.destroyed.store(true, Ordering::SeqCst);
+    }
+
+    async fn copy_file_range(
+        &self,
+        _req: Request,
+        _inode: Inode,
+        fh_in: u64,
+        _off_in: u64,
+        _inode_out: Inode,
+        _fh_out: u64,
+        _off_out: u64,
+        length: u64,
+        _flags: u64,
+    ) -> Result<ReplyCopyFileRange> {
+        self.copy_length.store(length, Ordering::SeqCst);
+
+        let copied = if fh_in == OVERREPORTING_FH {
+            length + 1
+        } else {
+            length
+        };
+
+        Ok(ReplyCopyFileRange { copied })
     }
 
     async fn lookup(&self, _req: Request, parent: Inode, name: &OsStr) -> Result<ReplyEntry> {
@@ -283,6 +309,40 @@ async fn unknown_opcode_gets_enosys_and_dispatch_continues() {
 
     harness.send(fuse_opcode::FUSE_LOOKUP as u32, 5, ROOT, b"hello\0");
     assert_eq!(out_header(&harness.reply().await).1, 0);
+
+    harness.finish().await;
+}
+
+fn copy_file_range_body(fh_in: u64, len: u64) -> Vec<u8> {
+    let mut body = Vec::new();
+    // fh_in, off_in, nodeid_out, fh_out, off_out, len, flags
+    for field in [fh_in, 0, HELLO, 1, 0, len, 0] {
+        body.extend_from_slice(&field.to_ne_bytes());
+    }
+    body
+}
+
+#[tokio::test]
+async fn copy_file_range_bounds_delegated_length() {
+    let mut harness = Harness::start();
+    harness.init(0).await;
+    let wire_max = u64::from(u32::MAX);
+
+    let body = copy_file_range_body(1, wire_max + 10);
+    harness.send(fuse_opcode::FUSE_COPY_FILE_RANGE as u32, 6, HELLO, &body);
+    let reply = harness.reply().await;
+
+    assert_eq!(harness.fs.copy_length.load(Ordering::SeqCst), wire_max);
+    assert_eq!(reply.len(), FUSE_OUT_HEADER_SIZE + FUSE_WRITE_OUT_SIZE);
+    assert_eq!(out_header(&reply), (reply.len(), 0, 6));
+    assert_eq!(u32_at(&reply, FUSE_OUT_HEADER_SIZE), u32::MAX);
+
+    let body = copy_file_range_body(OVERREPORTING_FH, wire_max + 10);
+    harness.send(fuse_opcode::FUSE_COPY_FILE_RANGE as u32, 7, HELLO, &body);
+    assert_eq!(
+        out_header(&harness.reply().await),
+        (FUSE_OUT_HEADER_SIZE, -libc::EIO, 7)
+    );
 
     harness.finish().await;
 }

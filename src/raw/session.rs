@@ -3980,6 +3980,8 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         };
 
         let fs = fs.clone();
+        // The reply carries the copied count in a u32.
+        let length = copy_file_range_in.len.min(u64::from(u32::MAX));
 
         spawn(debug_span!("fuse_copy_file_range"), async move {
             debug!(
@@ -3996,7 +3998,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                     copy_file_range_in.nodeid_out,
                     copy_file_range_in.fh_out,
                     copy_file_range_in.off_out,
-                    copy_file_range_in.len,
+                    length,
                     copy_file_range_in.flags,
                 )
                 .await
@@ -4008,6 +4010,18 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
 
                 Ok(reply_copy_file_range) => reply_copy_file_range,
             };
+
+            if reply_copy_file_range.copied > length {
+                error!(
+                    copied = reply_copy_file_range.copied,
+                    length,
+                    unique = request.unique,
+                    "copy_file_range reported more bytes than requested"
+                );
+
+                resp_sender.send_err(&request, libc::EIO.into()).await;
+                return;
+            }
 
             let write_out: fuse_write_out = reply_copy_file_range.into();
 
