@@ -527,6 +527,9 @@ pub trait Filesystem {
     /// reduce data copy: in normal, data will copy from FUSE server to kernel, then to user-space,
     /// then to kernel, finally send back to FUSE server. By implement this method, data will only
     /// copy in FUSE server internal.
+    ///
+    /// `length` is at most `u32::MAX`, because the reply carries the copied count in 32 bits.
+    /// Copying fewer bytes than `length` is a valid result; reporting more is answered with `EIO`.
     #[allow(clippy::too_many_arguments)]
     async fn copy_file_range(
         &self,

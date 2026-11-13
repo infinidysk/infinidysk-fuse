@@ -528,6 +528,9 @@ pub trait PathFilesystem {
     /// then to kernel, finally send back to FUSE server. By implement this method, data will only
     /// copy in FUSE server internal.  when `from_path` or `to_path` is None, it means the path may
     /// be deleted.
+    ///
+    /// `length` is at most `u32::MAX`, because the reply carries the copied count in 32 bits.
+    /// Copying fewer bytes than `length` is a valid result; reporting more is answered with `EIO`.
     #[allow(clippy::too_many_arguments)]
     async fn copy_file_range(
         &self,
