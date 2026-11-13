@@ -767,6 +767,38 @@ async fn failed_notification_write_ends_session() {
 
 #[cfg(target_os = "linux")]
 #[tokio::test]
+async fn blocked_notification_does_not_hold_back_replies() {
+    let mut harness = Harness::start();
+    let notify = ready_notify(&mut harness).await;
+
+    let mut gate = harness.kernel.gate_next_write();
+    let notification =
+        tokio::spawn(async move { notify.invalid_entry(ROOT, "hello".into()).await });
+    timeout(WAIT, &mut gate.entered)
+        .await
+        .expect("the notification reaches its write within the timeout")
+        .expect("the gate is kept until the write enters it");
+
+    harness.send(fuse_opcode::FUSE_LOOKUP as u32, 3, ROOT, b"hello\0");
+    let reply = harness.reply().await;
+    assert_eq!(out_header(&reply), (reply.len(), 0, 3));
+
+    assert!(
+        gate.release(),
+        "the reply waited for the blocked notification"
+    );
+    timeout(WAIT, notification)
+        .await
+        .expect("the notification finishes within the timeout")
+        .expect("the notification task does not panic");
+    let notification = harness.reply().await;
+    assert_eq!(out_header(&notification).2, 0);
+
+    harness.finish().await;
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
 async fn rejected_reply_is_answered_with_eio() {
     let lookup = fuse_opcode::FUSE_LOOKUP as u32;
     let mut harness = Harness::start();

@@ -56,6 +56,8 @@ jobs:
   linux-mounted:
     name: Linux mounted tests
     runs-on: ubuntu-latest
+    # A lock-cycle regression can deadlock in the kernel; the test's fusectl abort needs root.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
 
@@ -75,7 +77,7 @@ jobs:
       # The mounted tests are Tokio-only today; fail if none of them ran.
       - name: Mounted tests (tokio-runtime)
         run: |
-          cargo test --locked -p infinidysk-fuse --test raw_notifier --test raw_unmount --features=tokio-runtime,file-lock,unprivileged -- --ignored 2>&1 | tee mounted.log
+          cargo test --locked -p infinidysk-fuse --test raw_notifier --test raw_unmount --test raw_lock_cycle --features=tokio-runtime,file-lock,unprivileged -- --ignored 2>&1 | tee mounted.log
           grep -qE 'test result: ok\. [1-9][0-9]* passed' mounted.log
 
   msrv:
