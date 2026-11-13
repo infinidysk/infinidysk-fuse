@@ -82,7 +82,10 @@ impl Errno {
         // Linux v6.12 fuse_dev_do_write rejects `error <= -ERESTARTSYS` (512) before matching the request.
         #[cfg(target_os = "linux")]
         const MAX_ERRNO: c_int = 511;
-        #[cfg(not(target_os = "linux"))]
+        // FreeBSD 15 fuse_device_write rejects `error > ELAST` with EINVAL.
+        #[cfg(target_os = "freebsd")]
+        const MAX_ERRNO: c_int = libc::ELAST;
+        #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
         const MAX_ERRNO: c_int = c_int::MAX;
 
         if (1..=MAX_ERRNO).contains(&self.0) {
@@ -123,5 +126,13 @@ mod tests {
         assert_eq!(Errno::from(511).reply_code(), -511);
         assert_eq!(Errno::from(512).reply_code(), -libc::EIO);
         assert_eq!(Errno::from(c_int::MAX).reply_code(), -libc::EIO);
+    }
+
+    #[cfg(target_os = "freebsd")]
+    #[test]
+    fn reply_code_respects_freebsd_range() {
+        assert_eq!(Errno::from(libc::ELAST).reply_code(), -libc::ELAST);
+        assert_eq!(Errno::from(libc::ELAST + 1).reply_code(), -libc::EIO);
+        assert_eq!(Errno::from(1000).reply_code(), -libc::EIO);
     }
 }
