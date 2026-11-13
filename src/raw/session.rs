@@ -21,6 +21,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::Context;
 use std::task::Poll;
+use std::task::ready;
 use std::time::Duration;
 
 #[cfg(all(not(feature = "tokio-runtime"), feature = "async-io-runtime"))]
@@ -76,32 +77,38 @@ pub struct MountHandle {
 }
 
 impl MountHandle {
+    /// Ends the session and unmounts the filesystem. A session error is returned even when the
+    /// unmount succeeds.
     pub async fn unmount(mut self) -> IoResult<()> {
         self.inner
             .take()
             .expect("unmount call twice")
-            .inner_unmount()
+            .inner_unmount(false)
             .await
     }
 }
 
 impl Drop for MountHandle {
     fn drop(&mut self) {
-        if let Some(inner) = self.inner.take() {
-            if inner.task.is_finished() {
-                return;
-            }
+        let Some(inner) = self.inner.take() else {
+            return;
+        };
 
-            #[cfg(all(not(feature = "tokio-runtime"), feature = "async-io-runtime"))]
-            {
-                task::spawn(inner.inner_unmount()).detach();
-            }
+        #[cfg(all(not(feature = "async-io-runtime"), feature = "tokio-runtime"))]
+        let runtime = inner.task.runtime.clone();
 
-            #[cfg(all(not(feature = "async-io-runtime"), feature = "tokio-runtime"))]
-            {
-                task::spawn(inner.inner_unmount());
+        let cleanup = async move {
+            if let Err(err) = inner.inner_unmount(true).await {
+                warn!(%err, "unmount on drop failed");
             }
-        }
+        };
+
+        #[cfg(all(not(feature = "tokio-runtime"), feature = "async-io-runtime"))]
+        task::spawn(cleanup).detach();
+
+        // The stored handle works without a runtime context on this thread.
+        #[cfg(all(not(feature = "async-io-runtime"), feature = "tokio-runtime"))]
+        drop(runtime.spawn(cleanup));
     }
 }
 
@@ -340,9 +347,50 @@ async fn grace_expired(grace: Duration) {
     }
 }
 
+/// The spawned session task and how it ended.
+#[derive(Debug)]
+struct SessionTask {
+    /// `None` once the [`MountHandle`] future has returned the session result.
+    handle: Option<JoinHandle<IoResult<()>>>,
+    /// Whether the session ended without an error, once the [`MountHandle`] future returned.
+    ended_ok: Option<bool>,
+    #[cfg(all(not(feature = "async-io-runtime"), feature = "tokio-runtime"))]
+    runtime: tokio::runtime::Handle,
+}
+
+#[cfg(all(not(feature = "tokio-runtime"), feature = "async-io-runtime"))]
+fn session_result(result: IoResult<()>) -> IoResult<()> {
+    result
+}
+
+#[cfg(all(not(feature = "async-io-runtime"), feature = "tokio-runtime"))]
+fn session_result(result: Result<IoResult<()>, task::JoinError>) -> IoResult<()> {
+    result.unwrap_or_else(|err| Err(IoError::other(format!("fuse session task failed: {err}"))))
+}
+
+#[cfg(all(not(feature = "tokio-runtime"), feature = "async-io-runtime"))]
+async fn blocking<T, F>(f: F) -> IoResult<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    Ok(task::spawn_blocking(f).await)
+}
+
+#[cfg(all(not(feature = "async-io-runtime"), feature = "tokio-runtime"))]
+async fn blocking<T, F>(f: F) -> IoResult<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    task::spawn_blocking(f)
+        .await
+        .map_err(|err| IoError::other(format!("blocking task failed: {err}")))
+}
+
 #[derive(Debug)]
 struct MountHandleInner {
-    task: JoinHandle<IoResult<()>>,
+    task: SessionTask,
     mount_path: PathBuf,
     destroy_notify: Arc<async_notify::Notify>,
     #[cfg(any(
@@ -353,92 +401,65 @@ struct MountHandleInner {
 }
 
 impl MountHandleInner {
-    async fn inner_unmount(self) -> IoResult<()> {
+    /// Ends the session, then unmounts. A session error wins over an unmount error. With
+    /// `keep_if_ended_ok`, a session that had already ended without an error is not unmounted.
+    async fn inner_unmount(mut self, keep_if_ended_ok: bool) -> IoResult<()> {
+        let ended = self
+            .task
+            .handle
+            .as_ref()
+            .is_none_or(|handle| handle.is_finished());
         self.destroy_notify.notify();
 
-        #[cfg(all(not(feature = "tokio-runtime"), feature = "async-io-runtime"))]
-        {
-            // wait destroy done
-            self.task.await?;
-
-            // TODO: freebsd mount is unprivileged, then unmount is unprivileged too?
-            #[cfg(target_os = "freebsd")]
-            {
-                task::spawn_blocking(move || {
-                    mount::unmount(&self.mount_path, MntFlags::MNT_SYNCHRONOUS)
-                })
-                .await?;
-            }
-
-            #[cfg(target_os = "macos")]
-            {
-                task::spawn_blocking(move || {
-                    mount::unmount(&self.mount_path, MntFlags::MNT_SYNCHRONOUS)
-                })
-                .await?;
-            }
-
-            #[cfg(target_os = "linux")]
-            {
-                #[cfg(all(target_os = "linux", feature = "unprivileged"))]
-                if self.unprivileged {
-                    let binary_path = find_fusermount3()?;
-                    let mut child = Command::new(binary_path)
-                        .args([OsStr::new("-u"), self.mount_path.as_os_str()])
-                        .spawn()?;
-                    if !child.status().await?.success() {
-                        return Err(IoError::other("call fusermount3 -u to unmount failed"));
-                    }
-
-                    return Ok(());
-                }
-
-                task::spawn_blocking(move || mount::umount(&self.mount_path)).await?;
-            }
+        let session = match self.task.handle.take() {
+            Some(handle) => session_result(handle.await),
+            // The MountHandle future already returned the session result.
+            None => Ok(()),
+        };
+        let ended_ok = self.task.ended_ok.unwrap_or(session.is_ok());
+        if keep_if_ended_ok && ended && ended_ok {
+            return Ok(());
         }
 
-        #[cfg(all(not(feature = "async-io-runtime"), feature = "tokio-runtime"))]
+        let unmounted = self.os_unmount().await;
+        match session {
+            Err(err) => {
+                if let Err(unmount_err) = unmounted {
+                    error!(%unmount_err, "unmount after a session error failed");
+                }
+                Err(err)
+            }
+            Ok(()) => unmounted,
+        }
+    }
+
+    async fn os_unmount(&self) -> IoResult<()> {
+        let mount_path = self.mount_path.clone();
+
+        // TODO: freebsd mount is unprivileged, then unmount is unprivileged too?
+        #[cfg(any(target_os = "freebsd", target_os = "macos"))]
+        blocking(move || mount::unmount(&mount_path, MntFlags::MNT_SYNCHRONOUS)).await??;
+
+        #[cfg(target_os = "linux")]
         {
-            // wait destroy done
-            self.task.await.unwrap()?;
-
-            // TODO: freebsd mount is unprivileged, then unmount is unprivileged too?
-            #[cfg(target_os = "freebsd")]
-            {
-                task::spawn_blocking(move || {
-                    mount::unmount(&self.mount_path, MntFlags::MNT_SYNCHRONOUS)
-                })
-                .await
-                .unwrap()?;
-            }
-            #[cfg(target_os = "macos")]
-            {
-                task::spawn_blocking(move || {
-                    mount::unmount(&self.mount_path, MntFlags::MNT_SYNCHRONOUS)
-                })
-                .await
-                .unwrap()?;
-            }
-
-            #[cfg(target_os = "linux")]
-            {
-                #[cfg(all(target_os = "linux", feature = "unprivileged"))]
-                if self.unprivileged {
-                    let binary_path = find_fusermount3()?;
-                    let mut child = Command::new(binary_path)
-                        .args([OsStr::new("-u"), self.mount_path.as_os_str()])
-                        .spawn()?;
-                    if !child.wait().await?.success() {
-                        return Err(IoError::other("call fusermount3 -u to unmount failed"));
-                    }
-
-                    return Ok(());
+            #[cfg(feature = "unprivileged")]
+            if self.unprivileged {
+                let binary_path = find_fusermount3()?;
+                let mut child = Command::new(binary_path)
+                    .args([OsStr::new("-u"), mount_path.as_os_str()])
+                    .spawn()?;
+                #[cfg(all(not(feature = "tokio-runtime"), feature = "async-io-runtime"))]
+                let status = child.status().await?;
+                #[cfg(all(not(feature = "async-io-runtime"), feature = "tokio-runtime"))]
+                let status = child.wait().await?;
+                if !status.success() {
+                    return Err(IoError::other("call fusermount3 -u to unmount failed"));
                 }
 
-                task::spawn_blocking(move || mount::umount(&self.mount_path))
-                    .await
-                    .unwrap()?;
+                return Ok(());
             }
+
+            blocking(move || mount::umount(&mount_path)).await??;
         }
 
         Ok(())
@@ -448,19 +469,19 @@ impl MountHandleInner {
 impl Future for MountHandle {
     type Output = IoResult<()>;
 
-    #[cfg(feature = "async-io-runtime")]
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        Pin::new(&mut self.inner.as_mut().expect("inner should be Some()").task).poll(cx)
-    }
+        let task = &mut self.inner.as_mut().expect("inner should be Some()").task;
+        let Some(handle) = task.handle.as_mut() else {
+            return Poll::Ready(Err(IoError::other(
+                "the session result was already returned",
+            )));
+        };
 
-    #[cfg(feature = "tokio-runtime")]
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        // The unwrap is necessary in order to provide the same API for both runtimes, and actually
-        // unwrap should not panic, when MountHandle is canceled by unmount method, user has no
-        // chance to poll again
-        Pin::new(&mut self.inner.as_mut().expect("inner should be Some()").task)
-            .poll(cx)
-            .map(Result::unwrap)
+        let result = session_result(ready!(Pin::new(handle).poll(cx)));
+        task.handle = None;
+        task.ended_ok = Some(result.is_ok());
+
+        Poll::Ready(result)
     }
 }
 
@@ -472,6 +493,8 @@ pub struct Session<FS> {
     response_sender: Option<Arc<ResponseSender>>,
     tasks: Option<RequestTasks>,
     callback_grace: Duration,
+    /// Set once `Filesystem::init` succeeded, so a later failure still runs `destroy`.
+    fs_initialized: bool,
     mount_options: MountOptions,
 }
 
@@ -506,6 +529,7 @@ impl<FS> Session<FS> {
             response_sender: None,
             tasks: None,
             callback_grace: CALLBACK_GRACE,
+            fs_initialized: false,
             mount_options,
         }
     }
@@ -582,7 +606,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
 
         Ok(MountHandle {
             inner: Some(MountHandleInner {
-                task: task::spawn(self.inner_mount()),
+                task: self.start(),
                 mount_path: mount_path.to_path_buf(),
                 destroy_notify: notify,
                 unprivileged: true,
@@ -617,7 +641,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
 
         Ok(MountHandle {
             inner: Some(MountHandleInner {
-                task: task::spawn(self.inner_mount()),
+                task: self.start(),
                 mount_path: mount_path.to_path_buf(),
                 destroy_notify: notify,
                 unprivileged: true,
@@ -667,7 +691,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
 
         Ok(MountHandle {
             inner: Some(MountHandleInner {
-                task: task::spawn(self.inner_mount()),
+                task: self.start(),
                 mount_path: mount_path.to_path_buf(),
                 destroy_notify: notify,
                 #[cfg(all(target_os = "linux", feature = "unprivileged"))]
@@ -710,7 +734,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
 
         Ok(MountHandle {
             inner: Some(MountHandleInner {
-                task: task::spawn(self.inner_mount()),
+                task: self.start(),
                 mount_path: mount_path.to_path_buf(),
                 destroy_notify: notify,
             }),
@@ -720,6 +744,33 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
     #[cfg(target_os = "macos")]
     pub async fn mount<P: AsRef<Path>>(self, fs: FS, mount_path: P) -> IoResult<MountHandle> {
         self.mount_with_unprivileged(fs, mount_path).await
+    }
+
+    /// Spawns the session. A panic in it becomes the session error.
+    fn start(self) -> SessionTask {
+        let session = AssertUnwindSafe(self.inner_mount())
+            .catch_unwind()
+            .map(|result| {
+                result.unwrap_or_else(|_| {
+                    error!("fuse session panicked");
+                    Err(IoError::other("fuse session panicked"))
+                })
+            });
+
+        #[cfg(all(not(feature = "tokio-runtime"), feature = "async-io-runtime"))]
+        let handle = task::spawn(session);
+
+        #[cfg(all(not(feature = "async-io-runtime"), feature = "tokio-runtime"))]
+        let runtime = tokio::runtime::Handle::current();
+        #[cfg(all(not(feature = "async-io-runtime"), feature = "tokio-runtime"))]
+        let handle = runtime.spawn(session);
+
+        SessionTask {
+            handle: Some(handle),
+            ended_ok: None,
+            #[cfg(all(not(feature = "async-io-runtime"), feature = "tokio-runtime"))]
+            runtime,
+        }
     }
 
     /// get response sender, it should be called after mount, otherwise it will panic
@@ -821,7 +872,14 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         let max_write = self
             .handle_init(request, data_ref, fuse_connection, fs)
             .await?;
-        fs.ready(self.get_notify()).await;
+        if AssertUnwindSafe(fs.ready(self.get_notify()))
+            .catch_unwind()
+            .await
+            .is_err()
+        {
+            error!("filesystem ready panicked");
+            return Err(IoError::other("filesystem ready panicked"));
+        }
         Ok(max_write)
     }
 
@@ -929,7 +987,16 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         let fuse_connection = self.fuse_connection.take().unwrap();
         let fs = self.filesystem.take().expect("filesystem not init");
 
-        let max_write = self.init_filesystem(&fs, &fuse_connection).await?.get() as usize;
+        let max_write = match self.init_filesystem(&fs, &fuse_connection).await {
+            Ok(max_write) => max_write.get() as usize,
+            Err(err) => {
+                if self.fs_initialized {
+                    fs.destroy(Request::default()).await;
+                    debug!("fuse destroyed");
+                }
+                return Err(err);
+            }
+        };
         let buffer_size = (max_write + FUSE_WRITE_IN_SIZE).max(FUSE_MIN_READ_BUFFER_SIZE);
 
         let header_buffer = vec![0; FUSE_IN_HEADER_SIZE];
@@ -978,7 +1045,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                     data_buffer = data_buf;
 
                     match in_header {
-                        // ponytail: a bad frame is dropped unanswered; ending the session waits for cleanup on session errors (#15).
+                        // ponytail: a bad frame is dropped unanswered until read errors get a retry policy.
                         Err(_) => continue,
 
                         Ok(in_header) => in_header,
@@ -1482,6 +1549,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
 
             Ok(reply) => reply,
         };
+        self.fs_initialized = true;
 
         let init_out = fuse_init_out {
             major: FUSE_KERNEL_VERSION,

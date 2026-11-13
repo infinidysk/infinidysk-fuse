@@ -75,7 +75,7 @@ jobs:
       # The mounted tests are Tokio-only today; fail if none of them ran.
       - name: Mounted tests (tokio-runtime)
         run: |
-          cargo test --locked -p infinidysk-fuse --test raw_notifier --features=tokio-runtime,file-lock,unprivileged -- --ignored 2>&1 | tee mounted.log
+          cargo test --locked -p infinidysk-fuse --test raw_notifier --test raw_unmount --features=tokio-runtime,file-lock,unprivileged -- --ignored 2>&1 | tee mounted.log
           grep -qE 'test result: ok\. [1-9][0-9]* passed' mounted.log
 
   msrv:
