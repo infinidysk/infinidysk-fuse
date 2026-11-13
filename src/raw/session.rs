@@ -129,35 +129,76 @@ impl ResponseSender {
 
     /// send response with only header, no data
     pub(crate) async fn send1(&self, header: &fuse_out_header) {
-        self.send(&[IoSlice::new(header.as_bytes())]).await;
+        self.send(header.unique, &[IoSlice::new(header.as_bytes())])
+            .await;
     }
 
     /// send response with header and data
     pub(crate) async fn send2(&self, header: &fuse_out_header, data: &[u8]) {
-        self.send(&[IoSlice::new(header.as_bytes()), IoSlice::new(data)])
-            .await;
+        self.send(
+            header.unique,
+            &[IoSlice::new(header.as_bytes()), IoSlice::new(data)],
+        )
+        .await;
     }
 
     /// send response with header and two parts of data.
     pub(crate) async fn send3(&self, header: &fuse_out_header, d1: &[u8], d2: &[u8]) {
-        self.send(&[
-            IoSlice::new(header.as_bytes()),
-            IoSlice::new(d1),
-            IoSlice::new(d2),
-        ])
+        self.send(
+            header.unique,
+            &[
+                IoSlice::new(header.as_bytes()),
+                IoSlice::new(d1),
+                IoSlice::new(d2),
+            ],
+        )
         .await;
     }
 
-    /// Send a response or notification from borrowed buffers in a single write.
-    pub(crate) async fn send(&self, bufs: &[IoSlice<'_>]) {
-        if let Err(err) = self.connection.write_vectored(bufs).await {
-            if err.kind() == ErrorKind::NotFound {
-                warn!(
-                    "may reply interrupted fuse request, ignore this error {}",
-                    err
-                );
-            } else {
-                error!("reply fuse failed {}", err);
+    /// Send the reply to request `unique` from borrowed buffers in a single write.
+    async fn send(&self, unique: u64, bufs: &[IoSlice<'_>]) {
+        let Err(err) = self.connection.write_vectored(bufs).await else {
+            return;
+        };
+
+        match err.raw_os_error() {
+            Some(libc::ENOENT) => {
+                warn!(%err, unique, "no pending request for this reply, it may have been interrupted");
+            }
+
+            #[cfg(target_os = "linux")]
+            Some(libc::EINVAL) => self.recover_rejected_reply(unique, &err).await,
+
+            _ => {
+                error!(%err, unique, "reply write failed");
+                self.fail();
+            }
+        }
+    }
+
+    /// Linux v6.12 fuse_dev_do_write can reject a reply with EINVAL before matching its request.
+    /// One header-only EIO completes the request if it is still pending.
+    #[cfg(target_os = "linux")]
+    async fn recover_rejected_reply(&self, unique: u64, err: &IoError) {
+        let header = fuse_out_header {
+            len: FUSE_OUT_HEADER_SIZE as u32,
+            error: -libc::EIO,
+            unique,
+        };
+
+        match self
+            .connection
+            .write_vectored(&[IoSlice::new(header.as_bytes())])
+            .await
+        {
+            Ok(_) => warn!(%err, unique, "kernel rejected a reply, the request got EIO instead"),
+
+            Err(fallback) if fallback.raw_os_error() == Some(libc::ENOENT) => {
+                warn!(%err, unique, "kernel rejected a reply after completing its request");
+            }
+
+            Err(fallback) => {
+                error!(%err, %fallback, unique, "kernel rejected a reply and its EIO fallback");
                 self.fail();
             }
         }
