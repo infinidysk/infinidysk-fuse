@@ -87,15 +87,18 @@ impl Filesystem for TestFs {
         ))
     }
 
-    async fn ready(&self, notify: Notify) {
+    // Not `async fn`, so the panic happens before a future exists.
+    fn ready(&self, notify: Notify) -> impl Future<Output = ()> + Send {
         assert!(
             !self.panic_in_ready.load(Ordering::SeqCst),
             "ready panics to test ready panics"
         );
-        *self
-            .notify
-            .lock()
-            .expect("no test panics while holding the notify lock") = Some(notify);
+        async move {
+            *self
+                .notify
+                .lock()
+                .expect("no test panics while holding the notify lock") = Some(notify);
+        }
     }
 
     async fn destroy(&self, _req: Request) {

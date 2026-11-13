@@ -872,7 +872,9 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         let max_write = self
             .handle_init(request, data_ref, fuse_connection, fs)
             .await?;
-        if AssertUnwindSafe(fs.ready(self.get_notify()))
+        let notify = self.get_notify();
+        // An implementation can panic before it returns its future.
+        if AssertUnwindSafe(async { fs.ready(notify).await })
             .catch_unwind()
             .await
             .is_err()
