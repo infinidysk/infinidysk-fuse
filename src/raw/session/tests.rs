@@ -69,6 +69,14 @@ impl Filesystem for TestFs {
         Ok(ReplyCopyFileRange { copied })
     }
 
+    async fn unlink(&self, _req: Request, _parent: Inode, name: &OsStr) -> Result<()> {
+        match name.to_str() {
+            Some("zero") => Err(0.into()),
+            Some("negative") => Err(libc::c_int::MIN.into()),
+            _ => Ok(()),
+        }
+    }
+
     async fn lookup(&self, _req: Request, parent: Inode, name: &OsStr) -> Result<ReplyEntry> {
         if parent != ROOT || name != "hello" {
             return Err(libc::ENOENT.into());
@@ -345,4 +353,43 @@ async fn copy_file_range_bounds_delegated_length() {
     );
 
     harness.finish().await;
+}
+
+#[tokio::test]
+async fn invalid_errno_becomes_eio() {
+    let mut harness = Harness::start();
+    harness.init(0).await;
+
+    for (unique, name) in [(8, b"zero\0".as_slice()), (9, b"negative\0")] {
+        harness.send(fuse_opcode::FUSE_UNLINK as u32, unique, ROOT, name);
+        assert_eq!(
+            out_header(&harness.reply().await),
+            (FUSE_OUT_HEADER_SIZE, -libc::EIO, unique)
+        );
+    }
+
+    harness.send(fuse_opcode::FUSE_UNLINK as u32, 10, ROOT, b"hello\0");
+    assert_eq!(
+        out_header(&harness.reply().await),
+        (FUSE_OUT_HEADER_SIZE, 0, 10)
+    );
+
+    harness.finish().await;
+}
+
+#[tokio::test]
+async fn malformed_init_gets_einval_and_ends_session() {
+    let mut harness = Harness::start();
+
+    harness.send(fuse_opcode::FUSE_INIT as u32, 1, 0, &[0; 4]);
+    assert_eq!(
+        out_header(&harness.reply().await),
+        (FUSE_OUT_HEADER_SIZE, -libc::EINVAL, 1)
+    );
+
+    let result = timeout(WAIT, harness.session)
+        .await
+        .expect("session ends within the timeout")
+        .expect("session task does not panic");
+    assert!(result.is_err(), "session ended with {result:?}");
 }

@@ -154,7 +154,7 @@ impl ResponseSender {
     async fn send_err(&self, request: &Request, err: Errno) {
         let out_header = fuse_out_header {
             len: FUSE_OUT_HEADER_SIZE as u32,
-            error: err.into(),
+            error: err.reply_code(),
             unique: request.unique,
         };
         self.send1(&out_header).await
@@ -1032,7 +1032,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
 
                 let init_out_header = fuse_out_header {
                     len: FUSE_OUT_HEADER_SIZE as u32,
-                    error: libc::EINVAL,
+                    error: -libc::EINVAL,
                     unique: request.unique,
                 };
 
@@ -1241,7 +1241,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             Err(err) => {
                 let init_out_header = fuse_out_header {
                     len: FUSE_OUT_HEADER_SIZE as u32,
-                    error: err.into(),
+                    error: err.reply_code(),
                     unique: request.unique,
                 };
 
@@ -1816,7 +1816,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             );
 
             let resp_value = if let Err(err) = fs.unlink(request, in_header.nodeid, &name).await {
-                err.into()
+                err.reply_code()
             } else {
                 0
             };
@@ -1866,7 +1866,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             );
 
             let resp_value = if let Err(err) = fs.rmdir(request, in_header.nodeid, &name).await {
-                err.into()
+                err.reply_code()
             } else {
                 0
             };
@@ -1961,7 +1961,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                 )
                 .await
             {
-                err.into()
+                err.reply_code()
             } else {
                 0
             };
@@ -2333,7 +2333,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                 )
                 .await
             {
-                err.into()
+                err.reply_code()
             } else {
                 0
             };
@@ -2388,7 +2388,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                 .fsync(request, in_header.nodeid, fsync_in.fh, data_sync)
                 .await
             {
-                err.into()
+                err.reply_code()
             } else {
                 0
             };
@@ -2486,7 +2486,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                 )
                 .await
             {
-                err.into()
+                err.reply_code()
             } else {
                 0
             };
@@ -2702,7 +2702,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
 
             let resp_value =
                 if let Err(err) = fs.removexattr(request, in_header.nodeid, &name).await {
-                    err.into()
+                    err.reply_code()
                 } else {
                     0
                 };
@@ -2755,7 +2755,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                 .flush(request, in_header.nodeid, flush_in.fh, flush_in.lock_owner)
                 .await
             {
-                err.into()
+                err.reply_code()
             } else {
                 0
             };
@@ -2970,7 +2970,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                 .releasedir(request, in_header.nodeid, release_in.fh, release_in.flags)
                 .await
             {
-                err.into()
+                err.reply_code()
             } else {
                 0
             };
@@ -3025,7 +3025,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                 .fsyncdir(request, in_header.nodeid, fsync_in.fh, data_sync)
                 .await
             {
-                err.into()
+                err.reply_code()
             } else {
                 0
             };
@@ -3164,7 +3164,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                 )
                 .await
             {
-                err.into()
+                err.reply_code()
             } else {
                 0
             };
@@ -3215,7 +3215,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
 
             let resp_value =
                 if let Err(err) = fs.access(request, in_header.nodeid, access_in.mask).await {
-                    err.into()
+                    err.reply_code()
                 } else {
                     0
                 };
@@ -3344,7 +3344,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             );
 
             let resp_value = if let Err(err) = fs.interrupt(request, interrupt_in.unique).await {
-                err.into()
+                err.reply_code()
             } else {
                 0
             };
@@ -3657,7 +3657,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                 )
                 .await
             {
-                err.into()
+                err.reply_code()
             } else {
                 0
             };
@@ -3877,7 +3877,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                 )
                 .await
             {
-                err.into()
+                err.reply_code()
             } else {
                 0
             };
