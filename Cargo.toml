@@ -1,14 +1,17 @@
 [package]
 name = "infinidysk-fuse"
 version = "0.10.0"
-authors = ["Sherlock Holo <sherlockya@gmail.com>"]
+authors = ["Sherlock Holo <sherlockya@gmail.com>", "hoivikaj"]
 edition = "2024"
 readme = "README.md"
 keywords = ["fuse", "filesystem", "system", "bindings"]
 categories = ["api-bindings", "filesystem"]
 license = "MIT"
+include = ["/src", "/tests", "/LICENSE", "/README.md"]
 repository = "https://github.com/infinidysk/infinidysk-fuse"
-description = "FUSE user-space library async version implementation."
+homepage = "https://github.com/infinidysk/infinidysk-fuse"
+documentation = "https://docs.rs/infinidysk-fuse"
+description = "Async FUSE user-space library for tokio and async-io. A fork of fuse3 maintained for infinidysk."
 rust-version = "1.91"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -52,6 +55,7 @@ nix = { version = "0.31.2", default-features = false, features = ["socket"] }
 rustdoc-args = ["--cfg", "docsrs"]
 features = ["file-lock", "unprivileged", "tokio-runtime"]
 targets = [
+  "aarch64-apple-darwin",
   "i686-unknown-freebsd",
   "i686-unknown-linux-gnu",
   "x86_64-unknown-freebsd",
