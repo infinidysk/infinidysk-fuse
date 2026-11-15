@@ -223,12 +223,8 @@ impl ResponseSender {
     }
 
     /// Send a notification in a single write. An error the kernel scopes to this notification
-    /// is logged; any other error ends the session, as for replies.
-    pub(crate) async fn send_notification(&self, bufs: &[IoSlice<'_>]) {
-        let _ = self.try_send_notification(bufs).await;
-    }
-
-    pub(crate) async fn try_send_notification(&self, bufs: &[IoSlice<'_>]) -> IoResult<()> {
+    /// is returned without ending the session; any other error also signals teardown.
+    pub(crate) async fn send_notification(&self, bufs: &[IoSlice<'_>]) -> IoResult<()> {
         #[cfg(target_os = "linux")]
         let result = self.write_notification(bufs).await;
         #[cfg(not(target_os = "linux"))]

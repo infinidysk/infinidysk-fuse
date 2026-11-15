@@ -1,7 +1,7 @@
 //! notify kernel.
 
 use std::ffi::OsString;
-use std::io::IoSlice;
+use std::io::{self, IoSlice};
 use std::os::unix::ffi::OsStrExt;
 use std::sync::Arc;
 
@@ -19,7 +19,12 @@ use crate::raw::abi::{
 use crate::raw::session::ResponseSender;
 
 #[derive(Debug, Clone)]
-/// notify kernel there are something need to handle.
+/// Send notifications to the kernel.
+///
+/// Every method waits for the notification write and returns its result. A local
+/// kernel rejection returns an error without ending the session. A transport
+/// failure or incomplete write returns an error and signals session teardown.
+/// Notifications never use the ordinary request-reply fallback.
 pub struct Notify {
     sender: Arc<ResponseSender>,
 }
@@ -29,9 +34,8 @@ impl Notify {
         Self { sender }
     }
 
-    /// notify kernel there are something need to handle. If notify failed, the error will be
-    /// logged; only errors that may have broken the connection end the session.
-    async fn notify(&mut self, kind: NotifyKind) {
+    /// Send one notification and return the kernel write result.
+    async fn notify(&mut self, kind: NotifyKind) -> io::Result<()> {
         match &kind {
             NotifyKind::Wakeup { kh } => {
                 let out_header = fuse_out_header {
@@ -47,7 +51,7 @@ impl Notify {
                         IoSlice::new(out_header.as_bytes()),
                         IoSlice::new(wakeup_out.as_bytes()),
                     ])
-                    .await;
+                    .await
             }
 
             NotifyKind::InvalidInode { inode, offset, len } => {
@@ -68,7 +72,7 @@ impl Notify {
                         IoSlice::new(out_header.as_bytes()),
                         IoSlice::new(invalid_inode_out.as_bytes()),
                     ])
-                    .await;
+                    .await
             }
 
             NotifyKind::InvalidEntry { parent, name } => {
@@ -92,7 +96,7 @@ impl Notify {
                         IoSlice::new(name.as_bytes()),
                         IoSlice::new(b"\0"),
                     ])
-                    .await;
+                    .await
             }
 
             NotifyKind::Delete {
@@ -121,7 +125,7 @@ impl Notify {
                         IoSlice::new(name.as_bytes()),
                         IoSlice::new(b"\0"),
                     ])
-                    .await;
+                    .await
             }
 
             NotifyKind::Store {
@@ -148,7 +152,7 @@ impl Notify {
                         IoSlice::new(store_out.as_bytes()),
                         IoSlice::new(data),
                     ])
-                    .await;
+                    .await
             }
 
             NotifyKind::Retrieve {
@@ -176,76 +180,66 @@ impl Notify {
                         IoSlice::new(out_header.as_bytes()),
                         IoSlice::new(retrieve_out.as_bytes()),
                     ])
-                    .await;
+                    .await
             }
-        };
+        }
     }
 
     /// try to notify kernel the IO is ready, kernel can wakeup the waiting program.
-    pub async fn wakeup(mut self, kh: u64) {
-        self.notify(NotifyKind::Wakeup { kh }).await;
+    pub async fn wakeup(mut self, kh: u64) -> io::Result<()> {
+        self.notify(NotifyKind::Wakeup { kh }).await
     }
 
     /// try to notify the cache invalidation about an inode.
-    pub async fn invalid_inode(mut self, inode: u64, offset: i64, len: i64) {
+    /// A negative offset invalidates attributes only. A zero length invalidates
+    /// all cached data from the offset onward. Success does not drain earlier reads.
+    pub async fn invalid_inode(mut self, inode: u64, offset: i64, len: i64) -> io::Result<()> {
         self.notify(NotifyKind::InvalidInode { inode, offset, len })
-            .await;
-    }
-
-    /// Invalidate an inode and report whether the kernel accepted the notification.
-    pub async fn try_invalid_inode(self, inode: u64, offset: i64, len: i64) -> std::io::Result<()> {
-        let header = fuse_out_header {
-            len: (FUSE_OUT_HEADER_SIZE + FUSE_NOTIFY_INVAL_INODE_OUT_SIZE) as u32,
-            error: fuse_notify_code::FUSE_NOTIFY_INVAL_INODE as i32,
-            unique: 0,
-        };
-        let body = fuse_notify_inval_inode_out {
-            ino: inode,
-            off: offset,
-            len,
-        };
-        self.sender
-            .try_send_notification(&[
-                IoSlice::new(header.as_bytes()),
-                IoSlice::new(body.as_bytes()),
-            ])
             .await
     }
 
     /// try to notify the invalidation about a directory entry.
-    pub async fn invalid_entry(mut self, parent: u64, name: OsString) {
-        self.notify(NotifyKind::InvalidEntry { parent, name }).await;
+    pub async fn invalid_entry(mut self, parent: u64, name: OsString) -> io::Result<()> {
+        self.notify(NotifyKind::InvalidEntry { parent, name }).await
     }
 
     /// try to notify a directory entry has been deleted.
-    pub async fn delete(mut self, parent: u64, child: u64, name: OsString) {
+    pub async fn delete(mut self, parent: u64, child: u64, name: OsString) -> io::Result<()> {
         self.notify(NotifyKind::Delete {
             parent,
             child,
             name,
         })
-        .await;
+        .await
     }
 
     /// try to push the data in an inode for updating the kernel cache.
-    pub async fn store(mut self, inode: u64, offset: u64, mut data: impl Buf) {
+    /// An error may leave part of the data stored in the kernel cache.
+    pub async fn store(mut self, inode: u64, offset: u64, mut data: impl Buf) -> io::Result<()> {
         self.notify(NotifyKind::Store {
             inode,
             offset,
             data: data.copy_to_bytes(data.remaining()),
         })
-        .await;
+        .await
     }
 
     /// try to retrieve data in an inode from the kernel cache.
-    pub async fn retrieve(mut self, notify_unique: u64, inode: u64, offset: u64, size: u32) {
+    /// Success submits the request; the data arrives later through `Filesystem::notify_reply`.
+    pub async fn retrieve(
+        mut self,
+        notify_unique: u64,
+        inode: u64,
+        offset: u64,
+        size: u32,
+    ) -> io::Result<()> {
         self.notify(NotifyKind::Retrieve {
             notify_unique,
             inode,
             offset,
             size,
         })
-        .await;
+        .await
     }
 }
 

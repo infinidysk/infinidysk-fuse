@@ -159,7 +159,7 @@ async fn invalidate_cached_data_without_poll() {
         // No poll implementation and no lock held while notifying the kernel.
         let notify = state.notifier.lock().unwrap().clone().unwrap();
         tokio::runtime::Handle::current()
-            .block_on(notify.try_invalid_inode(2, 0, 0))
+            .block_on(notify.invalid_inode(2, 0, 0))
             .unwrap();
         file.seek(SeekFrom::Start(0)).unwrap();
         file.read_exact(&mut bytes).unwrap();
@@ -178,11 +178,9 @@ async fn store_cached_data_without_poll() {
         assert_eq!(&bytes, b"before");
 
         let notify = state.notifier.lock().unwrap().clone().unwrap();
-        tokio::runtime::Handle::current().block_on(notify.store(
-            2,
-            2,
-            Bytes::from_static(b"\0\xff!"),
-        ));
+        tokio::runtime::Handle::current()
+            .block_on(notify.store(2, 2, Bytes::from_static(b"\0\xff!")))
+            .unwrap();
 
         file.seek(SeekFrom::Start(0)).unwrap();
         file.read_exact(&mut bytes).unwrap();
@@ -210,7 +208,9 @@ async fn invalidate_cached_entry_without_poll() {
         );
 
         let notify = state.notifier.lock().unwrap().clone().unwrap();
-        tokio::runtime::Handle::current().block_on(notify.invalid_entry(1, "file".into()));
+        tokio::runtime::Handle::current()
+            .block_on(notify.invalid_entry(1, "file".into()))
+            .unwrap();
         assert_eq!(std::fs::metadata(&path).unwrap().ino(), 3);
         assert!(
             state.lookups.load(Ordering::SeqCst) > lookups,
@@ -238,7 +238,9 @@ async fn delete_cached_entry_without_poll() {
         );
 
         let notify = state.notifier.lock().unwrap().clone().unwrap();
-        tokio::runtime::Handle::current().block_on(notify.delete(1, 2, "file".into()));
+        tokio::runtime::Handle::current()
+            .block_on(notify.delete(1, 2, "file".into()))
+            .unwrap();
         assert_eq!(
             std::fs::metadata(&path).unwrap_err().raw_os_error(),
             Some(libc::ENOENT)
