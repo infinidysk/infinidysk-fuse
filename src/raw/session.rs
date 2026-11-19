@@ -223,15 +223,19 @@ impl ResponseSender {
     }
 
     /// Send a notification in a single write. An error the kernel scopes to this notification
-    /// is logged; any other error ends the session, as for replies.
-    pub(crate) async fn send_notification(&self, bufs: &[IoSlice<'_>]) {
+    /// is returned without ending the session; any other error also signals teardown.
+    pub(crate) async fn send_notification(&self, bufs: &[IoSlice<'_>]) -> IoResult<()> {
         #[cfg(target_os = "linux")]
         let result = self.write_notification(bufs).await;
         #[cfg(not(target_os = "linux"))]
         let result = self.connection.write_vectored(bufs).await;
 
-        let Err(err) = result else {
-            return;
+        let err = match result {
+            Ok(written) if written == bufs.iter().map(|buf| buf.len()).sum::<usize>() => {
+                return Ok(());
+            }
+            Ok(_) => IoError::new(ErrorKind::WriteZero, "incomplete notification write"),
+            Err(err) => err,
         };
 
         if notification_rejected_locally(&err) {
@@ -240,6 +244,7 @@ impl ResponseSender {
             error!(%err, "notification write failed");
             self.fail();
         }
+        Err(err)
     }
 
     /// Linux v6.12 fuse_reverse_inval_entry waits for a parent inode lock that a pending lookup holds

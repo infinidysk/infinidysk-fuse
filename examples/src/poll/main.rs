@@ -14,7 +14,7 @@ use infinidysk_fuse::{MountOptions, Result};
 use mio::unix::SourceFd;
 use mio::{Events, Interest, Token};
 use tokio::time;
-use tracing::{debug, info, Level};
+use tracing::{debug, info, warn, Level};
 
 const CONTENT: &str = "hello world\n";
 
@@ -354,7 +354,10 @@ impl Filesystem for Poll {
 
                 ready.store(true, Ordering::SeqCst);
 
-                notify.wakeup(kh).await;
+                if let Err(err) = notify.wakeup(kh).await {
+                    warn!(%err, "poll wakeup failed");
+                    return;
+                }
 
                 debug!("notify done");
             });

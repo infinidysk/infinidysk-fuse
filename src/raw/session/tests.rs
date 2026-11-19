@@ -739,7 +739,11 @@ async fn rejected_notification_keeps_session() {
     let notify = ready_notify(&mut harness).await;
 
     harness.kernel.fail_next_write(rejected);
-    notify.invalid_entry(ROOT, "hello".into()).await;
+    let error = notify
+        .invalid_entry(ROOT, "hello".into())
+        .await
+        .unwrap_err();
+    assert_eq!(error.raw_os_error(), Some(rejected));
 
     harness.send(fuse_opcode::FUSE_LOOKUP as u32, 3, ROOT, b"hello\0");
     let reply = harness.reply().await;
@@ -749,12 +753,167 @@ async fn rejected_notification_keeps_session() {
 }
 
 #[tokio::test]
+async fn checked_invalidation_reports_a_local_rejection() {
+    let mut harness = Harness::start();
+    let notify = ready_notify(&mut harness).await;
+    notify.clone().invalid_inode(HELLO, 0, 0).await.unwrap();
+    let frame = harness.reply().await;
+    assert_eq!(
+        out_header(&frame),
+        (
+            FUSE_OUT_HEADER_SIZE + FUSE_NOTIFY_INVAL_INODE_OUT_SIZE,
+            fuse_notify_code::FUSE_NOTIFY_INVAL_INODE as i32,
+            0
+        )
+    );
+    harness.kernel.fail_next_write(libc::ENOENT);
+    let error = notify.invalid_inode(HELLO, 0, 0).await.unwrap_err();
+    assert_eq!(error.raw_os_error(), Some(libc::ENOENT));
+    harness.send(fuse_opcode::FUSE_LOOKUP as u32, 3, ROOT, b"hello\0");
+    let reply = harness.reply().await;
+    assert_eq!(out_header(&reply), (reply.len(), 0, 3));
+    harness.finish().await;
+}
+
+/// Exercise the public API for every notification, including those without mounted tests.
+async fn send_test_notification(notify: Notify, code: &fuse_notify_code) -> IoResult<()> {
+    match code {
+        fuse_notify_code::FUSE_POLL => notify.wakeup(7).await,
+        fuse_notify_code::FUSE_NOTIFY_INVAL_INODE => notify.invalid_inode(HELLO, 0, 0).await,
+        fuse_notify_code::FUSE_NOTIFY_INVAL_ENTRY => {
+            notify.invalid_entry(ROOT, "hello".into()).await
+        }
+        fuse_notify_code::FUSE_NOTIFY_DELETE => notify.delete(ROOT, HELLO, "hello".into()).await,
+        fuse_notify_code::FUSE_NOTIFY_STORE => notify.store(HELLO, 0, &b"hello"[..]).await,
+        fuse_notify_code::FUSE_NOTIFY_RETRIEVE => notify.retrieve(7, HELLO, 0, 5).await,
+    }
+}
+
+fn notification_codes() -> [fuse_notify_code; 6] {
+    [
+        fuse_notify_code::FUSE_POLL,
+        fuse_notify_code::FUSE_NOTIFY_INVAL_INODE,
+        fuse_notify_code::FUSE_NOTIFY_INVAL_ENTRY,
+        fuse_notify_code::FUSE_NOTIFY_DELETE,
+        fuse_notify_code::FUSE_NOTIFY_STORE,
+        fuse_notify_code::FUSE_NOTIFY_RETRIEVE,
+    ]
+}
+
+#[tokio::test]
+async fn every_notification_reports_success_and_local_rejection() {
+    for code in notification_codes() {
+        let mut harness = Harness::start();
+        let notify = ready_notify(&mut harness).await;
+        send_test_notification(notify.clone(), &code).await.unwrap();
+        let frame = harness.reply().await;
+
+        harness.kernel.fail_next_write(libc::ENOENT);
+        let error = send_test_notification(notify, &code).await.unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::ENOENT));
+        assert_eq!(out_header(&frame), (frame.len(), code as i32, 0));
+        // Any synthetic reply with unique 0 would arrive before this unrelated reply.
+        harness.send(fuse_opcode::FUSE_LOOKUP as u32, 3, ROOT, b"hello\0");
+        let reply = harness.reply().await;
+        assert_eq!(out_header(&reply), (reply.len(), 0, 3));
+        harness.finish().await;
+    }
+}
+
+#[tokio::test]
+async fn every_notification_reports_a_disconnected_transport() {
+    for code in notification_codes() {
+        let mut harness = Harness::start();
+        let notify = ready_notify(&mut harness).await;
+        harness.kernel.replies.close();
+        let error = send_test_notification(notify, &code).await.unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::ENODEV));
+        let (_, fs) = session_error(harness).await;
+        assert!(fs.destroyed.load(Ordering::SeqCst));
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn notification_rejection_never_uses_reply_fallback() {
+    for code in notification_codes() {
+        let mut harness = Harness::start();
+        let notify = ready_notify(&mut harness).await;
+        harness.kernel.fail_next_write(libc::EINVAL);
+        let error = send_test_notification(notify, &code).await.unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EINVAL));
+        // EINVAL on an ordinary reply triggers an EIO fallback. Notifications must not.
+        harness.send(fuse_opcode::FUSE_LOOKUP as u32, 3, ROOT, b"hello\0");
+        let reply = harness.reply().await;
+        assert_eq!(out_header(&reply), (reply.len(), 0, 3));
+        harness.finish().await;
+    }
+}
+
+#[tokio::test]
+async fn every_notification_rejects_an_incomplete_write() {
+    for code in notification_codes() {
+        let mut harness = Harness::start();
+        let notify = ready_notify(&mut harness).await;
+        harness.kernel.short_next_write(FUSE_OUT_HEADER_SIZE);
+        let error = send_test_notification(notify, &code).await.unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::WriteZero);
+        let (_, fs) = session_error(harness).await;
+        assert!(fs.destroyed.load(Ordering::SeqCst));
+    }
+}
+
+#[tokio::test]
+async fn checked_invalidation_reports_a_broken_connection() {
+    let mut harness = Harness::start();
+    let notify = ready_notify(&mut harness).await;
+    harness.kernel.fail_next_write(libc::EIO);
+    let error = notify.invalid_inode(HELLO, 0, 0).await.unwrap_err();
+    assert_eq!(error.raw_os_error(), Some(libc::EIO));
+    let (_, fs) = session_error(harness).await;
+    assert!(fs.destroyed.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn checked_invalidation_rejects_an_incomplete_write() {
+    let mut harness = Harness::start();
+    let notify = ready_notify(&mut harness).await;
+    harness.kernel.short_next_write(16);
+    let error = notify.invalid_inode(HELLO, 0, 0).await.unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::WriteZero);
+    let (_, fs) = session_error(harness).await;
+    assert!(fs.destroyed.load(Ordering::SeqCst));
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn checked_invalidation_waits_for_the_write_without_blocking_replies() {
+    let mut harness = Harness::start();
+    let notify = ready_notify(&mut harness).await;
+    let mut gate = harness.kernel.gate_next_write();
+    let notification = tokio::spawn(async move { notify.invalid_inode(HELLO, 0, 0).await });
+    timeout(WAIT, &mut gate.entered).await.unwrap().unwrap();
+    assert!(!notification.is_finished());
+    harness.send(fuse_opcode::FUSE_LOOKUP as u32, 3, ROOT, b"hello\0");
+    let reply = harness.reply().await;
+    assert_eq!(out_header(&reply), (reply.len(), 0, 3));
+    assert!(gate.release());
+    timeout(WAIT, notification).await.unwrap().unwrap().unwrap();
+    assert_eq!(out_header(&harness.reply().await).2, 0);
+    harness.finish().await;
+}
+
+#[tokio::test]
 async fn failed_notification_write_ends_session() {
     let mut harness = Harness::start();
     let notify = ready_notify(&mut harness).await;
 
     harness.kernel.fail_next_write(libc::EIO);
-    notify.invalid_entry(ROOT, "hello".into()).await;
+    let error = notify
+        .invalid_entry(ROOT, "hello".into())
+        .await
+        .unwrap_err();
+    assert_eq!(error.raw_os_error(), Some(libc::EIO));
 
     let err = timeout(WAIT, harness.session)
         .await
@@ -790,7 +949,8 @@ async fn blocked_notification_does_not_hold_back_replies() {
     timeout(WAIT, notification)
         .await
         .expect("the notification finishes within the timeout")
-        .expect("the notification task does not panic");
+        .expect("the notification task does not panic")
+        .expect("the kernel accepts the notification");
     let notification = harness.reply().await;
     assert_eq!(out_header(&notification).2, 0);
 

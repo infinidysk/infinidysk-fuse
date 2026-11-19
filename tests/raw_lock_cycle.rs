@@ -176,6 +176,7 @@ async fn notification_waiting_for_a_parent_lock_does_not_hold_back_replies() {
     timeout(WAIT, notification)
         .await
         .expect("the lookup reply does not wait for the blocked notification")
+        .unwrap()
         .unwrap();
 
     let err = lookup.join().unwrap().expect_err("the gated lookup misses");

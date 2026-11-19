@@ -33,6 +33,24 @@ The crate is imported as `infinidysk_fuse`.
 The two runtime features are mutually exclusive. The crate does not build
 with neither.
 
+## Notifications (breaking change for 0.11)
+
+Every method on the notifier passed to `Filesystem::ready` now returns
+`std::io::Result<()>`: `wakeup`, `invalid_inode`, `invalid_entry`, `delete`,
+`store` and `retrieve`. Handle the result with `?` or explicit error handling.
+The temporary `try_invalid_inode` method is replaced by `invalid_inode`.
+
+Each call waits for its kernel write. Local kernel rejections return an error
+without ending the session. Transport failures and incomplete writes return
+an error and signal session teardown. Notification failures never send an
+ordinary error reply with request ID zero.
+
+For changed file bytes, await `notify.invalid_inode(inode, 0, 0)` and check
+the result before finalizing publication. Coordinate in-flight reads too:
+invalidation alone does not stop an old reply from filling the cache again.
+For `retrieve`, success means the request was sent; data arrives later through
+`Filesystem::notify_reply`. A failed `store` can leave partially stored data.
+
 ## Quick start
 
 Implement `raw::Filesystem` (inode-based) or `path::PathFilesystem`
