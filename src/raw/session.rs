@@ -19,6 +19,7 @@ use std::path::{Path, PathBuf};
 use std::pin::{Pin, pin};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, PoisonError};
 use std::task::Context;
 use std::task::Poll;
 use std::task::ready;
@@ -60,6 +61,7 @@ use crate::find_fusermount3;
 use crate::helper::*;
 use crate::notify::Notify;
 use crate::raw::abi::*;
+use crate::raw::connection::BlockingReads;
 #[cfg(any(feature = "async-io-runtime", feature = "tokio-runtime"))]
 use crate::raw::connection::FuseConnection;
 use crate::raw::filesystem::Filesystem;
@@ -448,24 +450,33 @@ fn session_result(result: Result<IoResult<()>, task::JoinError>) -> IoResult<()>
     result.unwrap_or_else(|err| Err(IoError::other(format!("fuse session task failed: {err}"))))
 }
 
-#[cfg(all(not(feature = "tokio-runtime"), feature = "async-io-runtime"))]
-async fn blocking<T, F>(f: F) -> IoResult<T>
-where
-    T: Send + 'static,
-    F: FnOnce() -> T + Send + 'static,
-{
-    Ok(task::spawn_blocking(f).await)
-}
+/// How long teardown waits, after the unmount, for blocking reads to return.
+const READER_EXIT: Duration = Duration::from_secs(10);
 
-#[cfg(all(not(feature = "async-io-runtime"), feature = "tokio-runtime"))]
-async fn blocking<T, F>(f: F) -> IoResult<T>
+/// Runs `f` on its own thread. A full blocking pool could otherwise queue the unmount behind
+/// the blocking read that only the unmount releases.
+async fn on_own_thread<T, F>(name: &str, f: F) -> IoResult<T>
 where
     T: Send + 'static,
     F: FnOnce() -> T + Send + 'static,
 {
-    task::spawn_blocking(f)
-        .await
-        .map_err(|err| IoError::other(format!("blocking task failed: {err}")))
+    let slot = Arc::new(Mutex::new(None));
+    let done = Arc::new(async_notify::Notify::new());
+    let (result, finished) = (slot.clone(), done.clone());
+    std::thread::Builder::new()
+        .name(name.into())
+        .spawn(move || {
+            let value = std::panic::catch_unwind(AssertUnwindSafe(f));
+            *result.lock().unwrap_or_else(PoisonError::into_inner) = Some(value);
+            finished.notify();
+        })?;
+
+    loop {
+        if let Some(value) = slot.lock().unwrap_or_else(PoisonError::into_inner).take() {
+            return value.map_err(|_| IoError::other(format!("{name} thread panicked")));
+        }
+        done.notified().await;
+    }
 }
 
 #[derive(Debug)]
@@ -473,6 +484,7 @@ struct MountHandleInner {
     task: SessionTask,
     mount_path: PathBuf,
     destroy_notify: Arc<async_notify::Notify>,
+    reads: Arc<BlockingReads>,
     #[cfg(any(
         all(target_os = "linux", feature = "unprivileged"),
         target_os = "macos"
@@ -481,14 +493,16 @@ struct MountHandleInner {
 }
 
 impl MountHandleInner {
-    /// Ends the session, then unmounts. A session error wins over an unmount error. With
-    /// `keep_if_ended_ok`, a session that had already ended without an error is not unmounted.
+    /// Ends the session, then unmounts, then waits for blocking reads. A session error wins over
+    /// an unmount error. With `keep_if_ended_ok`, a session that had already ended without an
+    /// error is not unmounted.
     async fn inner_unmount(mut self, keep_if_ended_ok: bool) -> IoResult<()> {
         let ended = self
             .task
             .handle
             .as_ref()
             .is_none_or(|handle| handle.is_finished());
+        self.reads.close();
         self.destroy_notify.notify();
 
         let session = match self.task.handle.take() {
@@ -498,10 +512,15 @@ impl MountHandleInner {
         };
         let ended_ok = self.task.ended_ok.unwrap_or(session.is_ok());
         if keep_if_ended_ok && ended && ended_ok {
-            return Ok(());
+            // The kernel ended the session, so it has already released any blocking read.
+            return self.reads_exited().await;
         }
 
-        let unmounted = self.os_unmount().await;
+        // Only the unmount releases a blocked read, so wait for reads after it, never before.
+        let unmounted = match self.os_unmount().await {
+            Ok(()) => self.reads_exited().await,
+            Err(err) => Err(err),
+        };
         match session {
             Err(err) => {
                 if let Err(unmount_err) = unmounted {
@@ -513,12 +532,31 @@ impl MountHandleInner {
         }
     }
 
+    /// Waits up to [`READER_EXIT`] until no blocking read runs.
+    async fn reads_exited(&self) -> IoResult<()> {
+        if self.reads.idle() {
+            return Ok(());
+        }
+
+        let exited = pin!(self.reads.exited());
+        let expired = pin!(grace_expired(READER_EXIT));
+        match future::select(exited, expired).await {
+            Either::Left(_) => Ok(()),
+            Either::Right(_) => Err(IoError::other(
+                "a blocking fuse read did not return after unmount",
+            )),
+        }
+    }
+
     async fn os_unmount(&self) -> IoResult<()> {
         let mount_path = self.mount_path.clone();
 
         // TODO: freebsd mount is unprivileged, then unmount is unprivileged too?
         #[cfg(any(target_os = "freebsd", target_os = "macos"))]
-        blocking(move || mount::unmount(&mount_path, MntFlags::MNT_SYNCHRONOUS)).await??;
+        on_own_thread("fuse-unmount", move || {
+            mount::unmount(&mount_path, MntFlags::MNT_SYNCHRONOUS)
+        })
+        .await??;
 
         #[cfg(target_os = "linux")]
         {
@@ -539,7 +577,7 @@ impl MountHandleInner {
                 return Ok(());
             }
 
-            blocking(move || mount::umount(&mount_path)).await??;
+            on_own_thread("fuse-unmount", move || mount::umount(&mount_path)).await??;
         }
 
         Ok(())
@@ -678,6 +716,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         )
         .await?;
 
+        let reads = fuse_connection.blocking_reads();
         self.fuse_connection.replace(Arc::new(fuse_connection));
 
         self.filesystem.replace(Arc::new(fs));
@@ -689,6 +728,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                 task: self.start(),
                 mount_path: mount_path.to_path_buf(),
                 destroy_notify: notify,
+                reads,
                 unprivileged: true,
             }),
         })
@@ -713,6 +753,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         )
         .await?;
 
+        let reads = fuse_connection.blocking_reads();
         self.fuse_connection.replace(Arc::new(fuse_connection));
 
         self.filesystem.replace(Arc::new(fs));
@@ -724,6 +765,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                 task: self.start(),
                 mount_path: mount_path.to_path_buf(),
                 destroy_notify: notify,
+                reads,
                 unprivileged: true,
             }),
         })
@@ -763,6 +805,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             return Err(err.into());
         }
 
+        let reads = fuse_connection.blocking_reads();
         self.fuse_connection.replace(Arc::new(fuse_connection));
 
         self.filesystem.replace(Arc::new(fs));
@@ -774,6 +817,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                 task: self.start(),
                 mount_path: mount_path.to_path_buf(),
                 destroy_notify: notify,
+                reads,
                 #[cfg(all(target_os = "linux", feature = "unprivileged"))]
                 unprivileged: false,
             }),
@@ -806,6 +850,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             }
         }
 
+        let reads = fuse_connection.blocking_reads();
         self.fuse_connection.replace(Arc::new(fuse_connection));
 
         self.filesystem.replace(Arc::new(fs));
@@ -817,6 +862,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                 task: self.start(),
                 mount_path: mount_path.to_path_buf(),
                 destroy_notify: notify,
+                reads,
             }),
         })
     }

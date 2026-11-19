@@ -74,7 +74,9 @@ use tracing::debug;
 #[cfg(target_os = "freebsd")]
 use tracing::warn;
 
-use super::CompleteIoResult;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use super::shut_down_error;
+use super::{BlockingReads, CompleteIoResult};
 #[cfg(any(
     all(target_os = "linux", feature = "unprivileged"),
     target_os = "macos"
@@ -86,6 +88,7 @@ use crate::find_fusermount3;
 #[derive(Debug)]
 pub struct FuseConnection {
     unmount_notify: Arc<Notify>,
+    reads: Arc<BlockingReads>,
     mode: ConnectionMode,
 }
 
@@ -98,6 +101,7 @@ impl FuseConnection {
 
             Ok(Self {
                 unmount_notify,
+                reads: Arc::default(),
                 mode: ConnectionMode::NonBlock(connection),
             })
         }
@@ -108,6 +112,7 @@ impl FuseConnection {
 
             Ok(Self {
                 unmount_notify,
+                reads: Arc::default(),
                 mode: ConnectionMode::Block(connection),
             })
         }
@@ -124,6 +129,7 @@ impl FuseConnection {
 
         Ok(Self {
             unmount_notify,
+            reads: Arc::default(),
             mode: ConnectionMode::NonBlock(connection),
         })
     }
@@ -139,6 +145,7 @@ impl FuseConnection {
 
         Ok(Self {
             unmount_notify,
+            reads: Arc::default(),
             mode: ConnectionMode::Block(connection),
         })
     }
@@ -150,6 +157,7 @@ impl FuseConnection {
         (
             Self {
                 unmount_notify: Arc::new(Notify::new()),
+                reads: Arc::default(),
                 mode: ConnectionMode::Memory(connection),
             },
             kernel,
@@ -158,7 +166,13 @@ impl FuseConnection {
 
     /// The current or next `read_vectored` returns `None`, which ends dispatch.
     pub(crate) fn shut_down(&self) {
+        self.reads.close();
         self.unmount_notify.notify();
+    }
+
+    /// The blocking reads of this connection, which can outlive their `read_vectored` futures.
+    pub(crate) fn blocking_reads(&self) -> Arc<BlockingReads> {
+        self.reads.clone()
     }
 
     pub async fn read_vectored<T: DerefMut<Target = [u8]> + Send + 'static>(
@@ -183,7 +197,9 @@ impl FuseConnection {
         match &self.mode {
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             ConnectionMode::Block(connection) => {
-                connection.read_vectored(header_buf, data_buf).await
+                connection
+                    .read_vectored(&self.reads, header_buf, data_buf)
+                    .await
             }
             #[cfg(any(
                 all(target_os = "linux", feature = "unprivileged"),
@@ -217,7 +233,7 @@ impl FuseConnection {
     #[cfg(target_os = "linux")]
     pub(crate) fn write_vectored_blocking(&self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
         match &self.mode {
-            ConnectionMode::Block(connection) => (&connection.file).write_vectored(bufs),
+            ConnectionMode::Block(connection) => (&*connection.file).write_vectored(bufs),
             #[cfg(feature = "unprivileged")]
             ConnectionMode::NonBlock(connection) => {
                 uio::writev(&connection.fd, bufs).map_err(Into::into)
@@ -244,11 +260,15 @@ enum ConnectionMode {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[derive(Debug)]
 struct BlockFuseConnection {
-    file: File,
+    /// Shared with each read worker, so the descriptor stays open until the worker exits.
+    file: Arc<File>,
     read: Mutex<()>,
     // Linux v6.12 fuse_dev_write handles concurrent whole-message writes independently.
     #[cfg(not(target_os = "linux"))]
     write: Mutex<()>,
+    /// Each read worker waits on this twice before its syscall.
+    #[cfg(test)]
+    gate: Option<Arc<std::sync::Barrier>>,
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -259,10 +279,18 @@ impl BlockFuseConnection {
 
         let file = OpenOptions::new().write(true).read(true).open(DEV_FUSE)?;
 
-        Ok(Self {
-            file,
+        Ok(Self::from_file(file))
+    }
+
+    fn from_file(file: File) -> Self {
+        Self {
+            file: Arc::new(file),
             read: Mutex::new(()),
-        })
+            #[cfg(not(target_os = "linux"))]
+            write: Mutex::new(()),
+            #[cfg(test)]
+            gate: None,
+        }
     }
 
     #[cfg(target_os = "macos")]
@@ -365,36 +393,39 @@ impl BlockFuseConnection {
         .unwrap()?;
 
         let file = unsafe { File::from_raw_fd(fd) };
-        Ok(Self {
-            file,
-            read: Mutex::new(()),
-            write: Mutex::new(()),
-        })
+        Ok(Self::from_file(file))
     }
 
     async fn read_vectored<T: DerefMut<Target = [u8]> + Send + 'static>(
         &self,
+        reads: &Arc<BlockingReads>,
         mut header_buf: Vec<u8>,
         mut data_buf: T,
     ) -> CompleteIoResult<(Vec<u8>, T), usize> {
         use std::io::Read;
-        use std::mem::ManuallyDrop;
-        use std::os::fd::{AsRawFd, FromRawFd};
 
         let _guard = self.read.lock().await;
-        let fd = self.file.as_raw_fd();
+        let Some(read) = reads.start() else {
+            return ((header_buf, data_buf), Err(shut_down_error()));
+        };
+        let file = self.file.clone();
+        #[cfg(test)]
+        let gate = self.gate.clone();
 
+        // A dropped JoinHandle neither stops a started closure nor drops a queued one.
         let ((header_buf, data_buf), res) = task::spawn_blocking(move || {
-            // Safety: when we call read, the fd is still valid, when fd is closed and file is
-            // dropped, the read operation will return error
-            let file = unsafe { File::from_raw_fd(fd) };
-            // avoid close the file
-            let mut file = ManuallyDrop::new(file);
+            #[cfg(test)]
+            if let Some(gate) = gate {
+                gate.wait();
+                gate.wait();
+            }
 
-            let res = file.read_vectored(&mut [
+            let res = (&*file).read_vectored(&mut [
                 IoSliceMut::new(&mut header_buf),
                 IoSliceMut::new(&mut data_buf),
             ]);
+            drop(file);
+            drop(read);
 
             ((header_buf, data_buf), res)
         })
@@ -407,7 +438,7 @@ impl BlockFuseConnection {
     async fn write_vectored(&self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
         #[cfg(not(target_os = "linux"))]
         let _guard = self.write.lock().await;
-        (&self.file).write_vectored(bufs)
+        (&*self.file).write_vectored(bufs)
     }
 }
 
@@ -605,5 +636,126 @@ impl AsFd for FuseConnection {
             #[cfg(test)]
             ConnectionMode::Memory(_) => unreachable!("only mount code asks for the device fd"),
         }
+    }
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+mod tests {
+    use std::io::Write;
+    use std::os::fd::AsRawFd;
+    use std::pin::pin;
+    use std::sync::{Arc, Barrier};
+    use std::time::Duration;
+
+    use futures_util::FutureExt;
+
+    use super::BlockFuseConnection;
+    use crate::raw::connection::BlockingReads;
+    use crate::raw::connection::test_util::{pair, unread, within};
+
+    const LIMIT: Duration = Duration::from_secs(5);
+
+    fn runtime(max_blocking_threads: usize) -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .max_blocking_threads(max_blocking_threads)
+            .build()
+            .expect("build runtime")
+    }
+
+    /// Polls a read once, then drops its future, so only the blocking worker is left. With a
+    /// gate, the future is dropped only after the worker has entered.
+    fn start_and_cancel(connection: &BlockFuseConnection, reads: &Arc<BlockingReads>) {
+        let mut read = pin!(connection.read_vectored(reads, vec![0; 16], vec![0; 16]));
+        assert!(read.as_mut().now_or_never().is_none());
+        if let Some(gate) = &connection.gate {
+            gate.wait();
+        }
+    }
+
+    #[test]
+    fn started_read_keeps_its_descriptor_after_cancel_and_drop() {
+        runtime(4).block_on(async {
+            let (ours, mut peer) = pair();
+            let gate = Arc::new(Barrier::new(2));
+            let mut connection = BlockFuseConnection::from_file(ours);
+            connection.gate = Some(gate.clone());
+            let original = connection.file.as_raw_fd();
+            let reads = Arc::new(BlockingReads::default());
+
+            start_and_cancel(&connection, &reads);
+            drop(connection);
+
+            let (reused, mut reused_peer) = pair();
+            assert_ne!(reused.as_raw_fd(), original);
+            assert_ne!(reused_peer.as_raw_fd(), original);
+            peer.write_all(b"original").expect("write original");
+            reused_peer.write_all(b"reused").expect("write reused");
+            gate.wait();
+
+            assert!(within(LIMIT, reads.exited()).await.is_some());
+            assert_eq!(unread(reused), b"reused");
+        });
+    }
+
+    #[test]
+    fn queued_read_keeps_its_descriptor_after_cancel_and_drop() {
+        runtime(1).block_on(async {
+            let busy = Arc::new(Barrier::new(2));
+            let occupant = tokio::task::spawn_blocking({
+                let busy = busy.clone();
+                move || {
+                    busy.wait();
+                    busy.wait();
+                }
+            });
+            busy.wait();
+
+            let (ours, mut peer) = pair();
+            let connection = BlockFuseConnection::from_file(ours);
+            let original = connection.file.as_raw_fd();
+            let reads = Arc::new(BlockingReads::default());
+
+            start_and_cancel(&connection, &reads);
+            assert!(!reads.idle(), "a queued read counts as running");
+            drop(connection);
+
+            let (reused, mut reused_peer) = pair();
+            assert_ne!(reused.as_raw_fd(), original);
+            assert_ne!(reused_peer.as_raw_fd(), original);
+            peer.write_all(b"original").expect("write original");
+            reused_peer.write_all(b"reused").expect("write reused");
+            busy.wait();
+
+            assert!(within(LIMIT, reads.exited()).await.is_some());
+            occupant.await.expect("occupant");
+            assert_eq!(unread(reused), b"reused");
+        });
+    }
+
+    #[test]
+    fn in_flight_read_ends_only_when_released_and_closed_reads_do_not_start() {
+        runtime(4).block_on(async {
+            let (ours, peer) = pair();
+            let gate = Arc::new(Barrier::new(2));
+            let mut connection = BlockFuseConnection::from_file(ours);
+            connection.gate = Some(gate.clone());
+            let reads = Arc::new(BlockingReads::default());
+
+            start_and_cancel(&connection, &reads);
+            gate.wait();
+            reads.close();
+            let waited = within(Duration::from_millis(200), reads.exited()).await;
+            assert!(waited.is_none(), "nothing released the read");
+
+            let (_, res) = connection
+                .read_vectored(&reads, vec![0; 16], vec![0; 16])
+                .await;
+            assert_eq!(res.expect_err("closed").raw_os_error(), Some(libc::ENODEV));
+
+            // Closing the peer stands in for the unmount that releases the read.
+            drop(peer);
+            assert!(within(LIMIT, reads.exited()).await.is_some());
+        });
     }
 }
