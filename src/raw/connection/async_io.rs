@@ -70,9 +70,9 @@ use tracing::debug;
 use crate::MountOptions;
 #[cfg(all(target_os = "linux", feature = "unprivileged"))]
 use crate::find_fusermount3;
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-use crate::raw::connection::shut_down_error;
 use crate::raw::connection::{BlockingReads, CompleteIoResult};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use crate::raw::connection::{Reader, shut_down_error};
 #[derive(Debug)]
 pub struct FuseConnection {
     unmount_notify: Arc<Notify>,
@@ -250,6 +250,7 @@ enum ConnectionMode {
 struct BlockFuseConnection {
     /// Shared with each read worker, so the descriptor stays open until the worker exits.
     file: Arc<File>,
+    reader: Reader,
     read: Mutex<()>,
     // Linux v6.12 fuse_dev_write handles concurrent whole-message writes independently.
     #[cfg(not(target_os = "linux"))]
@@ -267,18 +268,19 @@ impl BlockFuseConnection {
 
         let file = OpenOptions::new().write(true).read(true).open(DEV_FUSE)?;
 
-        Ok(Self::from_file(file))
+        Self::from_file(file)
     }
 
-    fn from_file(file: File) -> Self {
-        Self {
+    fn from_file(file: File) -> io::Result<Self> {
+        Ok(Self {
             file: Arc::new(file),
+            reader: Reader::new()?,
             read: Mutex::new(()),
             #[cfg(not(target_os = "linux"))]
             write: Mutex::new(()),
             #[cfg(test)]
             gate: None,
-        }
+        })
     }
 
     #[cfg(target_os = "macos")]
@@ -380,7 +382,7 @@ impl BlockFuseConnection {
         // Safety: fd is valid
         let file = unsafe { File::from_raw_fd(fd) };
 
-        Ok(Self::from_file(file))
+        Self::from_file(file)
     }
 
     async fn read_vectored<T: DerefMut<Target = [u8]> + Send + 'static>(
@@ -399,24 +401,25 @@ impl BlockFuseConnection {
         #[cfg(test)]
         let gate = self.gate.clone();
 
-        // A dropped Task drops a queued closure but does not stop a started one.
-        let ((header_buf, data_buf), res) = async_global_executor::spawn_blocking(move || {
-            #[cfg(test)]
-            if let Some(gate) = gate {
-                gate.wait();
-                gate.wait();
-            }
+        let ((header_buf, data_buf), res) = self
+            .reader
+            .run(move || {
+                #[cfg(test)]
+                if let Some(gate) = gate {
+                    gate.wait();
+                    gate.wait();
+                }
 
-            let res = (&*file).read_vectored(&mut [
-                IoSliceMut::new(&mut header_buf),
-                IoSliceMut::new(&mut data_buf),
-            ]);
-            drop(file);
-            drop(read);
+                let res = (&*file).read_vectored(&mut [
+                    IoSliceMut::new(&mut header_buf),
+                    IoSliceMut::new(&mut data_buf),
+                ]);
+                drop(file);
+                drop(read);
 
-            ((header_buf, data_buf), res)
-        })
-        .await;
+                ((header_buf, data_buf), res)
+            })
+            .await;
 
         ((header_buf, data_buf), res)
     }
@@ -608,7 +611,7 @@ mod tests {
     const LIMIT: Duration = Duration::from_secs(5);
 
     /// Polls a read once, waits until its worker has entered, then drops the future, so only
-    /// the worker is left. A dropped Task would cancel a worker that had not started.
+    /// the worker is left.
     fn start_and_cancel(connection: &BlockFuseConnection, reads: &Arc<BlockingReads>) {
         let mut read = pin!(connection.read_vectored(reads, vec![0; 16], vec![0; 16]));
         assert!(read.as_mut().now_or_never().is_none());
@@ -624,7 +627,7 @@ mod tests {
         async_global_executor::block_on(async {
             let (ours, mut peer) = pair();
             let gate = Arc::new(Barrier::new(2));
-            let mut connection = BlockFuseConnection::from_file(ours);
+            let mut connection = BlockFuseConnection::from_file(ours).expect("reader thread");
             connection.gate = Some(gate.clone());
             let original = connection.file.as_raw_fd();
             let reads = Arc::new(BlockingReads::default());
@@ -639,6 +642,7 @@ mod tests {
             reused_peer.write_all(b"reused").expect("write reused");
             gate.wait();
 
+            reads.close();
             assert!(within(LIMIT, reads.exited()).await.is_some());
             assert_eq!(unread(reused), b"reused");
         });
@@ -649,7 +653,7 @@ mod tests {
         async_global_executor::block_on(async {
             let (ours, peer) = pair();
             let gate = Arc::new(Barrier::new(2));
-            let mut connection = BlockFuseConnection::from_file(ours);
+            let mut connection = BlockFuseConnection::from_file(ours).expect("reader thread");
             connection.gate = Some(gate.clone());
             let reads = Arc::new(BlockingReads::default());
 

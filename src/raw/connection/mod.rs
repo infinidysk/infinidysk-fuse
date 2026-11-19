@@ -1,6 +1,10 @@
 use std::io;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::panic::AssertUnwindSafe;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::sync::Arc;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::sync::mpsc;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 #[cfg(all(not(feature = "tokio-runtime"), feature = "async-io-runtime"))]
@@ -59,7 +63,8 @@ impl BlockingReads {
         self.state().running == 0
     }
 
-    /// Completes once no read runs. Only one caller may wait at a time.
+    /// Completes once no read runs. Call [`Self::close`] first: only a closed tracker signals.
+    /// Only one caller may wait at a time.
     pub(crate) async fn exited(&self) {
         while !self.idle() {
             self.exited.notified().await;
@@ -75,13 +80,94 @@ struct ReadGuard(Arc<BlockingReads>);
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 impl Drop for ReadGuard {
     fn drop(&mut self) {
-        let idle = {
+        let exited = {
             let mut state = self.0.state();
             state.running -= 1;
-            state.running == 0
+            state.closed && state.running == 0
         };
-        if idle {
+        // Notifications accumulate, so signal only the one transition a waiter needs.
+        if exited {
             self.0.exited.notify();
+        }
+    }
+}
+
+/// A value one thread hands to one async waiter.
+#[derive(Debug)]
+pub(crate) struct Slot<T> {
+    value: Mutex<Option<T>>,
+    filled: async_notify::Notify,
+}
+
+impl<T> Default for Slot<T> {
+    fn default() -> Self {
+        Self {
+            value: Mutex::new(None),
+            filled: async_notify::Notify::new(),
+        }
+    }
+}
+
+impl<T> Slot<T> {
+    pub(crate) fn put(&self, value: T) {
+        *self.value.lock().unwrap_or_else(PoisonError::into_inner) = Some(value);
+        self.filled.notify();
+    }
+
+    pub(crate) async fn take(&self) -> T {
+        loop {
+            if let Some(value) = self
+                .value
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take()
+            {
+                return value;
+            }
+            self.filled.notified().await;
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+type Job = Box<dyn FnOnce() + Send>;
+
+/// The thread that runs a blocking connection's device reads. A blocked read then never holds
+/// a runtime blocking-pool thread that `destroy` or other callbacks need.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Debug)]
+struct Reader {
+    jobs: mpsc::Sender<Job>,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl Reader {
+    /// The thread exits once the connection drops this sender and the last job returns.
+    fn new() -> io::Result<Self> {
+        let (jobs, queue) = mpsc::channel::<Job>();
+        std::thread::Builder::new()
+            .name("fuse-reader".into())
+            .spawn(move || {
+                for job in queue {
+                    job();
+                }
+            })?;
+        Ok(Self { jobs })
+    }
+
+    /// Runs `job` on the reader thread. Dropping the future neither stops nor drops the job.
+    async fn run<R: Send + 'static>(&self, job: impl FnOnce() -> R + Send + 'static) -> R {
+        let slot = Arc::new(Slot::default());
+        let filled = slot.clone();
+        self.jobs
+            .send(Box::new(move || {
+                filled.put(std::panic::catch_unwind(AssertUnwindSafe(job)));
+            }))
+            .expect("the reader thread drains its queue until this sender drops, and jobs catch their panics");
+
+        match slot.take().await {
+            Ok(output) => output,
+            Err(panic) => std::panic::resume_unwind(panic),
         }
     }
 }
