@@ -6,19 +6,23 @@
 ))]
 use std::num::NonZeroU32;
 use std::path::Path;
-use std::sync::mpsc;
+use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::Duration;
 
 use infinidysk_fuse::raw::MountHandle;
 use infinidysk_fuse::{MountOptions, Result, raw::prelude::*};
 use tokio::runtime::{Builder, Runtime};
+use tokio::sync::Notify;
 use tokio::time::{sleep, timeout};
 
 const WAIT: Duration = Duration::from_secs(10);
 
-/// Accepts INIT and nothing else.
-struct Idle;
+/// Accepts INIT and nothing else. `destroy` needs the blocking pool, and waits for `hold` if set.
+#[derive(Default)]
+struct Idle {
+    hold: Option<Arc<Notify>>,
+}
 
 impl Filesystem for Idle {
     async fn init(&self, _: Request) -> Result<ReplyInit> {
@@ -27,7 +31,12 @@ impl Filesystem for Idle {
         ))
     }
 
-    async fn destroy(&self, _: Request) {}
+    async fn destroy(&self, _: Request) {
+        if let Some(hold) = &self.hold {
+            hold.notified().await;
+        }
+        tokio::task::spawn_blocking(|| ()).await.unwrap();
+    }
 
     #[cfg(feature = "file-lock")]
     async fn getlk(
@@ -76,7 +85,7 @@ fn is_mounted(path: &Path) -> bool {
         .any(|line| line.split(' ').nth(4) == Some(path))
 }
 
-/// One blocking thread, so a queued unmount would wait behind the blocked read forever.
+/// One blocking thread, so anything that holds it during teardown starves `destroy`.
 fn one_blocking_thread() -> Runtime {
     Builder::new_multi_thread()
         .worker_threads(2)
@@ -104,15 +113,15 @@ fn watchdog<T>(what: &'static str, f: impl FnOnce() -> T) -> T {
     output
 }
 
-/// Mounts [`Idle`] and returns once a lookup round trip shows dispatch runs.
-async fn mount_idle(path: &Path) -> MountHandle {
+/// Mounts `fs` and returns once a lookup round trip shows dispatch runs.
+async fn mount_idle(fs: Idle, path: &Path) -> MountHandle {
     let mut options = MountOptions::default();
     options.fs_name("infinidysk-fuse-direct-unmount-test");
     let handle = Session::new(options)
-        .mount(Idle, path)
+        .mount(fs, path)
         .await
         .expect("explicitly requested kernel test requires working FUSE");
-    // A plain thread: the runtime's only blocking thread now waits in the device read.
+    // A plain thread, so the lookup does not depend on the runtime under test.
     let missing = path.join("missing");
     thread::spawn(move || std::fs::metadata(missing))
         .join()
@@ -134,7 +143,7 @@ fn unmount_returns_and_the_runtime_drops_with_one_blocking_thread() {
 
     watchdog("mount and unmount", || {
         runtime.block_on(async {
-            let handle = mount_idle(directory.path()).await;
+            let handle = mount_idle(Idle::default(), directory.path()).await;
             handle.unmount().await.expect("unmount");
         })
     });
@@ -154,7 +163,7 @@ fn dropping_the_handle_unmounts_and_the_runtime_drops_with_one_blocking_thread()
 
     watchdog("mount and drop the handle", || {
         runtime.block_on(async {
-            drop(mount_idle(directory.path()).await);
+            drop(mount_idle(Idle::default(), directory.path()).await);
             timeout(WAIT, async {
                 while is_mounted(directory.path()) {
                     sleep(Duration::from_millis(20)).await;
@@ -164,5 +173,61 @@ fn dropping_the_handle_unmounts_and_the_runtime_drops_with_one_blocking_thread()
             .expect("dropping the handle unmounts within the timeout");
         })
     });
+    watchdog("runtime drop", || drop(runtime));
+}
+
+/// Waits on a plain thread until `path` is no longer mounted.
+fn wait_unmounted(path: &Path) {
+    while is_mounted(path) {
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+#[ignore = "requires root and Linux /dev/fuse; run explicitly with --ignored"]
+fn dropping_the_handle_and_then_the_runtime_still_unmounts() {
+    if !can_mount() {
+        eprintln!("skipped: needs root and /dev/fuse");
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let runtime = one_blocking_thread();
+
+    let handle = watchdog("mount", || {
+        runtime.block_on(mount_idle(Idle::default(), directory.path()))
+    });
+    watchdog("drop the handle and the runtime", || {
+        drop(handle);
+        drop(runtime);
+    });
+    watchdog("unmount after the runtime dropped", || {
+        wait_unmounted(directory.path())
+    });
+}
+
+#[test]
+#[ignore = "requires root and Linux /dev/fuse; run explicitly with --ignored"]
+fn cancelled_unmount_still_unmounts() {
+    if !can_mount() {
+        eprintln!("skipped: needs root and /dev/fuse");
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let runtime = one_blocking_thread();
+    let hold = Arc::new(Notify::new());
+
+    watchdog("cancel the unmount, then release destroy", || {
+        runtime.block_on(async {
+            let fs = Idle {
+                hold: Some(hold.clone()),
+            };
+            let handle = mount_idle(fs, directory.path()).await;
+            timeout(Duration::from_millis(200), handle.unmount())
+                .await
+                .expect_err("destroy is held, so the unmount cannot finish yet");
+            hold.notify_one();
+        })
+    });
+    watchdog("unmount after cancel", || wait_unmounted(directory.path()));
     watchdog("runtime drop", || drop(runtime));
 }

@@ -19,9 +19,10 @@ use std::path::{Path, PathBuf};
 use std::pin::{Pin, pin};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, PoisonError};
+use std::sync::mpsc::SendError;
 use std::task::Context;
 use std::task::Poll;
+use std::task::Waker;
 use std::task::ready;
 use std::time::Duration;
 
@@ -29,25 +30,11 @@ use std::time::Duration;
 use async_fs::read_dir;
 #[cfg(all(not(feature = "tokio-runtime"), feature = "async-io-runtime"))]
 use async_global_executor::{self as task, Task as JoinHandle};
-#[cfg(all(
-    target_os = "linux",
-    not(feature = "tokio-runtime"),
-    feature = "async-io-runtime",
-    feature = "unprivileged"
-))]
-use async_process::Command;
 use futures_util::future::{self, Either, FutureExt};
 use futures_util::stream::StreamExt;
 use nix::mount;
 #[cfg(any(target_os = "freebsd", target_os = "macos"))]
 use nix::mount::MntFlags;
-#[cfg(all(
-    target_os = "linux",
-    not(feature = "async-io-runtime"),
-    feature = "tokio-runtime",
-    feature = "unprivileged"
-))]
-use tokio::process::Command;
 #[cfg(all(not(feature = "async-io-runtime"), feature = "tokio-runtime"))]
 use tokio::task::JoinHandle;
 #[cfg(all(not(feature = "async-io-runtime"), feature = "tokio-runtime"))]
@@ -61,9 +48,9 @@ use crate::find_fusermount3;
 use crate::helper::*;
 use crate::notify::Notify;
 use crate::raw::abi::*;
-use crate::raw::connection::BlockingReads;
 #[cfg(any(feature = "async-io-runtime", feature = "tokio-runtime"))]
 use crate::raw::connection::FuseConnection;
+use crate::raw::connection::{BlockingReads, Slot};
 use crate::raw::filesystem::Filesystem;
 use crate::raw::reply::ReplyXAttr;
 use crate::raw::request::Request;
@@ -71,7 +58,7 @@ use crate::{Errno, SetAttr};
 
 /// A Future which returns when a file system is unmounted
 ///
-/// when drop the [`MountHandle`], it will unmount Filesystem in background task, if user want to
+/// when drop the [`MountHandle`], it will unmount Filesystem on a background thread, if user want to
 /// wait unmount completely, use [`MountHandle::unmount`]
 #[derive(Debug)]
 pub struct MountHandle {
@@ -82,17 +69,21 @@ impl MountHandle {
     /// Ends the session and unmounts the filesystem. A session error is returned even when the
     /// unmount succeeds.
     pub async fn unmount(mut self) -> IoResult<()> {
-        self.inner
-            .take()
-            .expect("unmount call twice")
-            .inner_unmount(false)
-            .await
+        let inner = self.inner.take().expect("unmount call twice");
+        match spawn_teardown(inner, false) {
+            Ok(teardown) => teardown.take().await,
+            // ponytail: with no thread to spare, a cancelled waiter abandons teardown; retry the spawn if this shows up.
+            Err(inner) => inner.inner_unmount(false).await,
+        }
     }
 }
 
 impl Drop for MountHandle {
     fn drop(&mut self) {
         let Some(inner) = self.inner.take() else {
+            return;
+        };
+        let Err(inner) = spawn_teardown(inner, true) else {
             return;
         };
 
@@ -453,30 +444,71 @@ fn session_result(result: Result<IoResult<()>, task::JoinError>) -> IoResult<()>
 /// How long teardown waits, after the unmount, for blocking reads to return.
 const READER_EXIT: Duration = Duration::from_secs(10);
 
-/// Runs `f` on its own thread. A full blocking pool could otherwise queue the unmount behind
-/// the blocking read that only the unmount releases.
-async fn on_own_thread<T, F>(name: &str, f: F) -> IoResult<T>
-where
-    T: Send + 'static,
-    F: FnOnce() -> T + Send + 'static,
-{
-    let slot = Arc::new(Mutex::new(None));
-    let done = Arc::new(async_notify::Notify::new());
-    let (result, finished) = (slot.clone(), done.clone());
-    std::thread::Builder::new()
-        .name(name.into())
+/// Starts teardown on its own thread, so neither a cancelled waiter nor a stopping runtime can
+/// abandon it before the unmount releases the device read. Gives `inner` back if no thread starts.
+fn spawn_teardown(
+    inner: MountHandleInner,
+    on_drop: bool,
+) -> Result<Arc<Slot<IoResult<()>>>, MountHandleInner> {
+    let slot = Arc::new(Slot::default());
+    let result = slot.clone();
+    let (handoff, received) = std::sync::mpsc::sync_channel::<MountHandleInner>(1);
+    let spawned = std::thread::Builder::new()
+        .name("fuse-teardown".into())
         .spawn(move || {
-            let value = std::panic::catch_unwind(AssertUnwindSafe(f));
-            *result.lock().unwrap_or_else(PoisonError::into_inner) = Some(value);
-            finished.notify();
-        })?;
-
-    loop {
-        if let Some(value) = slot.lock().unwrap_or_else(PoisonError::into_inner).take() {
-            return value.map_err(|_| IoError::other(format!("{name} thread panicked")));
-        }
-        done.notified().await;
+            let Ok(inner) = received.recv() else {
+                return;
+            };
+            let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                block_on(inner.inner_unmount(on_drop))
+            }))
+            .unwrap_or_else(|_| Err(IoError::other("fuse teardown panicked")));
+            if on_drop && let Err(err) = &outcome {
+                warn!(%err, "unmount on drop failed");
+            }
+            result.put(outcome);
+        });
+    if let Err(err) = spawned {
+        warn!(%err, "no teardown thread, tearing down on the runtime");
+        return Err(inner);
     }
+    handoff.send(inner).map_err(|SendError(inner)| inner)?;
+    Ok(slot)
+}
+
+/// Drives `fut` on the calling thread, without a runtime.
+fn block_on<F: Future>(fut: F) -> F::Output {
+    struct Unpark(std::thread::Thread);
+
+    impl std::task::Wake for Unpark {
+        fn wake(self: Arc<Self>) {
+            self.0.unpark();
+        }
+    }
+
+    let waker = Waker::from(Arc::new(Unpark(std::thread::current())));
+    let mut cx = Context::from_waker(&waker);
+    let mut fut = pin!(fut);
+    loop {
+        if let Poll::Ready(output) = fut.as_mut().poll(&mut cx) {
+            return output;
+        }
+        std::thread::park();
+    }
+}
+
+/// Completes after `limit`, or fails at once when the timer thread cannot start.
+async fn reader_deadline(limit: Duration) -> IoResult<()> {
+    let expired = Arc::new(async_notify::Notify::new());
+    let notify = expired.clone();
+    std::thread::Builder::new()
+        .name("fuse-reader-deadline".into())
+        .spawn(move || {
+            std::thread::sleep(limit);
+            notify.notify();
+        })?;
+    expired.notified().await;
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -517,7 +549,7 @@ impl MountHandleInner {
         }
 
         // Only the unmount releases a blocked read, so wait for reads after it, never before.
-        let unmounted = match self.os_unmount().await {
+        let unmounted = match self.os_unmount() {
             Ok(()) => self.reads_exited().await,
             Err(err) => Err(err),
         };
@@ -539,37 +571,31 @@ impl MountHandleInner {
         }
 
         let exited = pin!(self.reads.exited());
-        let expired = pin!(grace_expired(READER_EXIT));
+        let expired = pin!(reader_deadline(READER_EXIT));
         match future::select(exited, expired).await {
             Either::Left(_) => Ok(()),
-            Either::Right(_) => Err(IoError::other(
-                "a blocking fuse read did not return after unmount",
-            )),
+            Either::Right((deadline, _)) => {
+                deadline?;
+                Err(IoError::other(
+                    "a blocking fuse read did not return after unmount",
+                ))
+            }
         }
     }
 
-    async fn os_unmount(&self) -> IoResult<()> {
-        let mount_path = self.mount_path.clone();
-
+    /// Blocks the calling thread; teardown runs it on its own thread.
+    fn os_unmount(&self) -> IoResult<()> {
         // TODO: freebsd mount is unprivileged, then unmount is unprivileged too?
         #[cfg(any(target_os = "freebsd", target_os = "macos"))]
-        on_own_thread("fuse-unmount", move || {
-            mount::unmount(&mount_path, MntFlags::MNT_SYNCHRONOUS)
-        })
-        .await??;
+        mount::unmount(&self.mount_path, MntFlags::MNT_SYNCHRONOUS)?;
 
         #[cfg(target_os = "linux")]
         {
             #[cfg(feature = "unprivileged")]
             if self.unprivileged {
-                let binary_path = find_fusermount3()?;
-                let mut child = Command::new(binary_path)
-                    .args([OsStr::new("-u"), mount_path.as_os_str()])
-                    .spawn()?;
-                #[cfg(all(not(feature = "tokio-runtime"), feature = "async-io-runtime"))]
-                let status = child.status().await?;
-                #[cfg(all(not(feature = "async-io-runtime"), feature = "tokio-runtime"))]
-                let status = child.wait().await?;
+                let status = std::process::Command::new(find_fusermount3()?)
+                    .args([OsStr::new("-u"), self.mount_path.as_os_str()])
+                    .status()?;
                 if !status.success() {
                     return Err(IoError::other("call fusermount3 -u to unmount failed"));
                 }
@@ -577,7 +603,7 @@ impl MountHandleInner {
                 return Ok(());
             }
 
-            on_own_thread("fuse-unmount", move || mount::umount(&mount_path)).await??;
+            mount::umount(&self.mount_path)?;
         }
 
         Ok(())
