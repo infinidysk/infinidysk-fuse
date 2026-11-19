@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.11.0](https://github.com/infinidysk/infinidysk-fuse/compare/v0.10.1...v0.11.0) (2026-11-19)
+
+
+### ⚠ BREAKING CHANGES
+
+* **notify:** Every Notify method returns std::io::Result<()>. Callers must handle the result and replace try_invalid_inode with invalid_inode.
+
+### Features
+
+* **notify:** report errors from every kernel notification ([#63](https://github.com/infinidysk/infinidysk-fuse/issues/63)) ([f36b22d](https://github.com/infinidysk/infinidysk-fuse/commit/f36b22da8bea392a3b298e63ce0a7a1cd6cb0056))
+
+
+### Bug Fixes
+
+* **connection:** blocking device reads no longer outlive their descriptor or stall unmount ([#67](https://github.com/infinidysk/infinidysk-fuse/issues/67)) ([a39fad1](https://github.com/infinidysk/infinidysk-fuse/commit/a39fad14447de447d9dcc935ab2a7aef21570b4f))
+
 ## [0.10.1](https://github.com/infinidysk/infinidysk-fuse/compare/v0.10.0...v0.10.1) (2026-11-13)
 
 

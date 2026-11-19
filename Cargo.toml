@@ -1,6 +1,6 @@
 [package]
 name = "infinidysk-fuse"
-version = "0.10.1"
+version = "0.11.0"
 authors = ["Sherlock Holo <sherlockya@gmail.com>", "hoivikaj"]
 edition = "2024"
 readme = "README.md"
