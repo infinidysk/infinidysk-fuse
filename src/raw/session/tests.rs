@@ -1162,6 +1162,7 @@ fn mount_handle(fs: TestFs) -> (MountHandle, KernelSide, Arc<TestFs>) {
     let (connection, kernel) = FuseConnection::memory();
     let fs = Arc::new(fs);
 
+    let reads = connection.blocking_reads();
     let mut session = Session::new(MountOptions::default());
     session.fuse_connection = Some(Arc::new(connection));
     session.filesystem = Some(fs.clone());
@@ -1171,6 +1172,7 @@ fn mount_handle(fs: TestFs) -> (MountHandle, KernelSide, Arc<TestFs>) {
             task: session.start(),
             mount_path: PathBuf::from(NOT_MOUNTED),
             destroy_notify: Arc::new(async_notify::Notify::new()),
+            reads,
             #[cfg(any(
                 all(target_os = "linux", feature = "unprivileged"),
                 target_os = "macos"
