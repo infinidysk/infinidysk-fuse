@@ -17,6 +17,11 @@ pub(crate) use memory::KernelSide;
 
 #[cfg(feature = "async-io-runtime")]
 mod async_io;
+#[cfg(any(
+    all(target_os = "linux", feature = "unprivileged"),
+    target_os = "macos"
+))]
+mod handoff;
 #[cfg(test)]
 mod memory;
 #[cfg(feature = "tokio-runtime")]

@@ -16,13 +16,6 @@ use std::os::fd::BorrowedFd;
     target_os = "macos"
 ))]
 use std::os::fd::OwnedFd;
-#[cfg(target_os = "macos")]
-use std::os::fd::{AsRawFd, FromRawFd};
-#[cfg(any(
-    all(target_os = "linux", feature = "unprivileged"),
-    target_os = "macos"
-))]
-use std::os::unix::io::RawFd;
 use std::pin::pin;
 use std::sync::Arc;
 #[cfg(any(
@@ -50,7 +43,7 @@ use futures_util::{join, try_join};
     all(target_os = "linux", feature = "unprivileged"),
     target_os = "macos"
 ))]
-use nix::sys::socket::{self, AddressFamily, ControlMessageOwned, MsgFlags, SockFlag, SockType};
+use nix::sys::socket::SockType;
 #[cfg(any(
     all(target_os = "linux", feature = "unprivileged"),
     target_os = "freebsd",
@@ -70,6 +63,11 @@ use tracing::debug;
 use crate::MountOptions;
 #[cfg(all(target_os = "linux", feature = "unprivileged"))]
 use crate::find_fusermount3;
+#[cfg(any(
+    all(target_os = "linux", feature = "unprivileged"),
+    target_os = "macos"
+))]
+use crate::raw::connection::handoff;
 use crate::raw::connection::{BlockingReads, CompleteIoResult};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use crate::raw::connection::{Reader, shut_down_error};
@@ -292,97 +290,46 @@ impl BlockFuseConnection {
 
         use crate::find_macfuse_mount;
 
-        let (sock0, sock1) = match socket::socketpair(
-            AddressFamily::Unix,
-            SockType::Stream,
-            None,
-            SockFlag::empty(),
-        ) {
-            Err(err) => return Err(err.into()),
-
-            Ok((sock0, sock1)) => (sock0, sock1),
-        };
+        let (helper_end, our_end) = handoff::comm_pair(SockType::Stream)?;
 
         let binary_path = find_macfuse_mount()?;
-
-        const ENV: &str = "_FUSE_COMMFD";
 
         let options = mount_options.build();
 
         debug!("mount options {:?}", options);
 
-        let exec_path = match env::current_exe() {
-            Ok(path) => path,
-            Err(err) => return Err(err),
-        };
+        let exec_path = env::current_exe()?;
 
         let mount_path = mount_path.as_ref().as_os_str().to_os_string();
+        let mut command = handoff::helper_command(binary_path, &helper_end);
+        command
+            .env("_FUSE_CALL_BY_LIB", "1")
+            .env("_FUSE_COMMVERS", "2")
+            .env("_FUSE_DAEMON_PATH", exec_path)
+            .args(vec![options, mount_path]);
+        let mut child = Command::from(command).spawn()?;
+        drop(helper_end);
+        // mount_macfuse blocks until fuse init is done, so we can not join it in the current function
         async_global_executor::spawn(async move {
             debug!("mount_thread start");
-            let fd0 = sock0.as_raw_fd();
-            let mut binding = Command::new(binary_path);
-            let mut child = binding
-                .env(ENV, fd0.to_string())
-                .env("_FUSE_CALL_BY_LIB", "1")
-                .env("_FUSE_COMMVERS", "2")
-                .env("_FUSE_DAEMON_PATH", exec_path)
-                .args(vec![options, mount_path])
-                .spawn()?;
             if !child.status().await?.success() {
                 return Err(io::Error::other("fusermount run failed"));
             }
             Ok(())
-        });
+        })
+        .detach();
 
-        let fd1 = sock1.as_raw_fd();
         let fd = async_global_executor::spawn_blocking(move || {
             debug!("wait_thread start");
             // wait for macfuse mount command start
             // it seems that socket::recvmsg will not block to wait for the message
             // so we need to sleep for a while
             thread::sleep(Duration::from_secs(1));
-            // let mut buf = vec![0; 10000]; // buf should large enough
-            let mut buf = vec![]; // it seems 0 len still works well
-
-            let mut cmsg_buf = nix::cmsg_space!([RawFd; 1]);
-
-            let mut bufs = [IoSliceMut::new(&mut buf)];
-
-            let msg = match socket::recvmsg::<()>(
-                fd1,
-                &mut bufs[..],
-                Some(&mut cmsg_buf),
-                MsgFlags::empty(),
-            ) {
-                Err(err) => return Err(err.into()),
-
-                Ok(msg) => msg,
-            };
-
-            let mut cmsgs = match msg.cmsgs() {
-                Err(err) => return Err(err.into()),
-                Ok(cmsgs) => cmsgs,
-            };
-
-            let fd = if let Some(ControlMessageOwned::ScmRights(fds)) = cmsgs.next() {
-                if fds.is_empty() {
-                    return Err(io::Error::other("no fuse fd"));
-                }
-
-                fds[0]
-            } else {
-                return Err(io::Error::other("get fuse fd failed"));
-            };
-
-            Ok(fd)
+            handoff::recv_fd(our_end)
         })
-        .await
-        .unwrap();
+        .await?;
 
-        // Safety: fd is valid
-        let file = unsafe { File::from_raw_fd(fd) };
-
-        Self::from_file(file)
+        Self::from_file(File::from(fd))
     }
 
     async fn read_vectored<T: DerefMut<Target = [u8]> + Send + 'static>(
@@ -466,22 +413,9 @@ impl NonBlockFuseConnection {
         mount_options: MountOptions,
         mount_path: impl AsRef<Path>,
     ) -> io::Result<Self> {
-        use std::os::fd::{AsRawFd, FromRawFd};
-
-        let (sock0, sock1) = match socket::socketpair(
-            AddressFamily::Unix,
-            SockType::SeqPacket,
-            None,
-            SockFlag::empty(),
-        ) {
-            Err(err) => return Err(err.into()),
-
-            Ok((sock0, sock1)) => (sock0, sock1),
-        };
+        let (helper_end, our_end) = handoff::comm_pair(SockType::SeqPacket)?;
 
         let binary_path = find_fusermount3()?;
-
-        const ENV: &str = "_FUSE_COMMFD";
 
         let options = mount_options.build_with_unprivileged();
 
@@ -489,52 +423,17 @@ impl NonBlockFuseConnection {
 
         let mount_path = mount_path.as_ref().as_os_str().to_os_string();
 
-        let fd0 = sock0.as_raw_fd();
-        let mut child = Command::new(binary_path)
-            .env(ENV, fd0.to_string())
-            .args(vec![OsString::from("-o"), options, mount_path])
-            .spawn()?;
+        let mut command = handoff::helper_command(binary_path, &helper_end);
+        command.args(vec![OsString::from("-o"), options, mount_path]);
+        let mut child = Command::from(command).spawn()?;
+        // With our copy closed, the receive below ends once the helper exits without sending.
+        drop(helper_end);
 
         if !child.status().await?.success() {
             return Err(io::Error::other("fusermount run failed"));
         }
 
-        let fd1 = sock1.as_raw_fd();
-        let fd = async_global_executor::spawn_blocking(move || {
-            // let mut buf = vec![0; 10000]; // buf should large enough
-            let mut buf = vec![]; // it seems 0 len still works well
-
-            let mut cmsg_buf = nix::cmsg_space!([RawFd; 1]);
-
-            let mut bufs = [IoSliceMut::new(&mut buf)];
-
-            let msg = match socket::recvmsg::<()>(
-                fd1,
-                &mut bufs[..],
-                Some(&mut cmsg_buf),
-                MsgFlags::empty(),
-            ) {
-                Err(err) => return Err(err.into()),
-
-                Ok(msg) => msg,
-            };
-
-            let fd = if let Some(ControlMessageOwned::ScmRights(fds)) = msg.cmsgs()?.next() {
-                if fds.is_empty() {
-                    return Err(io::Error::other("no fuse fd"));
-                }
-
-                fds[0]
-            } else {
-                return Err(io::Error::other("get fuse fd failed"));
-            };
-
-            Ok(fd)
-        })
-        .await?;
-
-        // Safety: fd is valid
-        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        let fd = async_global_executor::spawn_blocking(move || handoff::recv_fd(our_end)).await?;
 
         Ok(Self {
             fd: Async::new(fd)?,
