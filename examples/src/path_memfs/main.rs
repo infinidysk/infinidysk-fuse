@@ -440,7 +440,7 @@ impl PathFilesystem for Fs {
         Ok(())
     }
 
-    async fn open(&self, _req: Request, path: &OsStr, flags: u32) -> Result<ReplyOpen> {
+    async fn open(&self, _req: Request, path: &OsStr, _flags: u32) -> Result<ReplyOpen> {
         let path = path.to_string_lossy();
         let paths = split_path(&path);
 
@@ -462,7 +462,8 @@ impl PathFilesystem for Fs {
         if entry.is_dir() {
             Err(Errno::new_is_dir())
         } else {
-            Ok(ReplyOpen { fh: 0, flags })
+            // reply flags are FOPEN_* bits, not the open(2) flags
+            Ok(ReplyOpen { fh: 0, flags: 0 })
         }
     }
 
