@@ -3,7 +3,12 @@
 //!
 //! Every descriptor here is close-on-exec in this process. Only the helper's child process
 //! clears the flag on its socket end, so no other child inherits the socket or the device.
+//!
+//! On Linux the flag is set atomically, when the socket is created and when the descriptor is
+//! received. macOS has no atomic form, so the flag is set right after each call; a child that
+//! another thread forks in that short window can still inherit the descriptor.
 
+#[cfg(target_os = "linux")]
 use std::ffi::OsStr;
 use std::io::{self, IoSliceMut};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -33,16 +38,19 @@ pub(super) fn comm_pair(ty: SockType) -> io::Result<(OwnedFd, OwnedFd)> {
     Ok(pair)
 }
 
-/// A command for `program` that inherits `helper_end` and learns its number from
-/// `_FUSE_COMMFD`.
-pub(super) fn helper_command(program: impl AsRef<OsStr>, helper_end: &OwnedFd) -> Command {
+/// Spawns `command` with `spawn` so that the child inherits `helper_end` and learns its number
+/// from `_FUSE_COMMFD`. `helper_end` is closed in this process once `spawn` returns.
+pub(super) fn spawn_helper<T>(
+    mut command: Command,
+    helper_end: OwnedFd,
+    spawn: impl FnOnce(Command) -> io::Result<T>,
+) -> io::Result<T> {
     let fd = helper_end.as_raw_fd();
-    let mut command = Command::new(program);
     command.env(COMM_FD_ENV, fd.to_string());
 
     // SAFETY: the closure runs in the forked child before exec and only calls `fcntl`, which
-    // is async-signal-safe. `fd` stays open in the parent until spawn returns, because the
-    // caller borrows `helper_end` across the spawn.
+    // is async-signal-safe. `fd` refers to `helper_end`, which this function owns until
+    // `spawn` returns, so the number cannot be reused for another descriptor meanwhile.
     unsafe {
         command.pre_exec(move || {
             let flags = libc::fcntl(fd, libc::F_GETFD);
@@ -53,17 +61,42 @@ pub(super) fn helper_command(program: impl AsRef<OsStr>, helper_end: &OwnedFd) -
         });
     }
 
-    command
+    let spawned = spawn(command);
+    drop(helper_end);
+    spawned
 }
 
-/// Room for more descriptors than the one expected, so a faulty helper's extras are reported
-/// and closed. Some kernels (macOS) install descriptors that do not fit without reporting them.
-const MAX_FDS: usize = 8;
+/// Unmounts `mount_path` after `fusermount3` mounted it but the descriptor handoff failed.
+/// Without this, closing the device aborts the connection but leaves a dead mount behind.
+#[cfg(target_os = "linux")]
+pub(super) fn unmount_after_failed_handoff(fusermount: &std::path::Path, mount_path: &OsStr) {
+    let status = Command::new(fusermount)
+        .args([
+            OsStr::new("-u"),
+            OsStr::new("-z"),
+            OsStr::new("--"),
+            mount_path,
+        ])
+        .status();
+
+    match status {
+        Ok(status) if status.success() => {}
+        Ok(status) => tracing::warn!(?status, "unmount after a failed fd handoff failed"),
+        Err(error) => tracing::warn!(%error, "unmount after a failed fd handoff failed"),
+    }
+}
+
+/// Room for every descriptor one message can carry on Linux (`SCM_MAX_FD`), so the control data
+/// is never truncated and a faulty helper's extras are all owned here and closed. When the
+/// control data is truncated, Linux installs descriptors that nix does not return.
+const MAX_FDS: usize = 253;
 
 /// Blocks until the helper sends exactly one descriptor on `sock`, and returns it close-on-exec.
 pub(super) fn recv_fd(sock: OwnedFd) -> io::Result<OwnedFd> {
-    // The helper may send a byte of data with the descriptor; only the descriptor matters.
-    let mut buf = [];
+    // The helper sends one byte with the descriptor. Receiving into a non-empty buffer makes
+    // a stream socket (macOS) wait for that byte instead of returning at once; it returns empty
+    // when the helper exits without sending.
+    let mut buf = [0; 1];
     let mut bufs = [IoSliceMut::new(&mut buf)];
     let mut cmsg_buf = nix::cmsg_space!([RawFd; MAX_FDS]);
 
@@ -221,15 +254,18 @@ mod tests {
             "test -e /dev/fd/${COMM_FD_ENV} && ! test -e /dev/fd/{}",
             ours.as_raw_fd()
         );
-        let status = helper_command("sh", &helper)
-            .args(["-c", &script])
-            .status()
-            .expect("run sh");
-        assert!(status.success(), "helper saw the wrong descriptors");
+        let mut command = Command::new("sh");
+        command.args(["-c", &script]);
+        let mut child =
+            spawn_helper(command, helper, |mut command| command.spawn()).expect("run sh");
         assert!(
-            is_cloexec(&helper),
-            "parent's helper end stays close-on-exec"
+            child.wait().expect("wait sh").success(),
+            "helper saw the wrong descriptors"
         );
+
+        // The helper exited and the parent's copy was closed by spawn_helper.
+        let ours = UnixStream::from(ours);
+        assert!(peer_closed(&ours), "spawn_helper kept the helper end open");
     }
 
     #[test]
@@ -246,6 +282,34 @@ mod tests {
         let (helper, ours) = comm_pair(TY).expect("comm pair");
         drop(helper);
         assert!(recv_fd(ours).is_err());
+    }
+
+    #[test]
+    fn receive_waits_for_a_late_send() {
+        let _serial = serialize();
+        let (reader, writer) = UnixStream::pair().expect("pair");
+        let (helper, ours) = comm_pair(TY).expect("comm pair");
+        let sender = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            send_fds(&helper, &[writer.as_raw_fd()]);
+        });
+
+        let received = recv_fd(ours).expect("receive the late fd");
+        sender.join().expect("sender thread");
+        drop(received);
+        assert!(peer_closed(&reader));
+    }
+
+    #[test]
+    fn many_extra_fds_are_closed_and_rejected() {
+        let _serial = serialize();
+        let (reader, writer) = UnixStream::pair().expect("pair");
+        let (helper, ours) = comm_pair(TY).expect("comm pair");
+        send_fds(&helper, &[writer.as_raw_fd(); 64]);
+        drop(writer);
+
+        assert!(recv_fd(ours).is_err());
+        assert!(peer_closed(&reader), "rejected descriptors were leaked");
     }
 
     #[test]

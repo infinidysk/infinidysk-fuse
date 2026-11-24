@@ -60,11 +60,10 @@ impl Filesystem for Empty {
     }
 }
 
-/// The descriptor targets the process `pid` holds open.
-fn open_targets(pid: u32) -> Vec<std::path::PathBuf> {
-    std::fs::read_dir(format!("/proc/{pid}/fd"))
-        .expect("list child descriptors")
-        .filter_map(|entry| std::fs::read_link(entry.ok()?.path()).ok())
+/// The descriptor targets the process `pid` holds open. Fails if any descriptor cannot be read.
+fn open_targets(pid: u32) -> std::io::Result<Vec<std::path::PathBuf>> {
+    std::fs::read_dir(format!("/proc/{pid}/fd"))?
+        .map(|entry| std::fs::read_link(entry?.path()))
         .collect()
 }
 
@@ -97,6 +96,7 @@ async fn children_do_not_inherit_the_fuse_device() {
         .expect("unmount within the timeout")
         .expect("unmount");
 
+    let targets = targets.expect("read every descriptor of the child");
     assert!(
         !targets
             .iter()

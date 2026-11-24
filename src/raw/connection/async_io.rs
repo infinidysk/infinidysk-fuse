@@ -286,8 +286,6 @@ impl BlockFuseConnection {
         mount_options: MountOptions,
         mount_path: impl AsRef<Path>,
     ) -> io::Result<Self> {
-        use std::{thread, time::Duration};
-
         use crate::find_macfuse_mount;
 
         let (helper_end, our_end) = handoff::comm_pair(SockType::Stream)?;
@@ -301,14 +299,15 @@ impl BlockFuseConnection {
         let exec_path = env::current_exe()?;
 
         let mount_path = mount_path.as_ref().as_os_str().to_os_string();
-        let mut command = handoff::helper_command(binary_path, &helper_end);
+        let mut command = std::process::Command::new(binary_path);
         command
             .env("_FUSE_CALL_BY_LIB", "1")
             .env("_FUSE_COMMVERS", "2")
             .env("_FUSE_DAEMON_PATH", exec_path)
             .args(vec![options, mount_path]);
-        let mut child = Command::from(command).spawn()?;
-        drop(helper_end);
+        let mut child = handoff::spawn_helper(command, helper_end, |command| {
+            Command::from(command).spawn()
+        })?;
         // mount_macfuse blocks until fuse init is done, so we can not join it in the current function
         async_global_executor::spawn(async move {
             debug!("mount_thread start");
@@ -321,10 +320,6 @@ impl BlockFuseConnection {
 
         let fd = async_global_executor::spawn_blocking(move || {
             debug!("wait_thread start");
-            // wait for macfuse mount command start
-            // it seems that socket::recvmsg will not block to wait for the message
-            // so we need to sleep for a while
-            thread::sleep(Duration::from_secs(1));
             handoff::recv_fd(our_end)
         })
         .await?;
@@ -423,17 +418,24 @@ impl NonBlockFuseConnection {
 
         let mount_path = mount_path.as_ref().as_os_str().to_os_string();
 
-        let mut command = handoff::helper_command(binary_path, &helper_end);
-        command.args(vec![OsString::from("-o"), options, mount_path]);
-        let mut child = Command::from(command).spawn()?;
-        // With our copy closed, the receive below ends once the helper exits without sending.
-        drop(helper_end);
+        let mut command = std::process::Command::new(&binary_path);
+        command.args([OsString::from("-o"), options, mount_path.clone()]);
+        // Our copy of the helper end closes once spawned, so the receive below ends when the
+        // helper exits without sending.
+        let mut child = handoff::spawn_helper(command, helper_end, |command| {
+            Command::from(command).spawn()
+        })?;
 
         if !child.status().await?.success() {
             return Err(io::Error::other("fusermount run failed"));
         }
 
-        let fd = async_global_executor::spawn_blocking(move || handoff::recv_fd(our_end)).await?;
+        let fd = async_global_executor::spawn_blocking(move || {
+            handoff::recv_fd(our_end).inspect_err(|_| {
+                handoff::unmount_after_failed_handoff(&binary_path, &mount_path);
+            })
+        })
+        .await?;
 
         Ok(Self {
             fd: Async::new(fd)?,
