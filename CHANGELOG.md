@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.12.0](https://github.com/infinidysk/infinidysk-fuse/compare/v0.11.0...v0.12.0) (2026-11-25)
+
+
+### ⚠ BREAKING CHANGES
+
+* **session:** atomic O_TRUNC, export support, POSIX ACLs, symlink caching and macOS case-insensitive names are no longer negotiated by default, and default_permissions(true) no longer enables POSIX ACLs. Enable the matching MountOptions setter to keep a capability.
+
+### Features
+
+* **session:** negotiate INIT capabilities only when opted in ([#69](https://github.com/infinidysk/infinidysk-fuse/issues/69)) ([7779c24](https://github.com/infinidysk/infinidysk-fuse/commit/7779c24bca586e26d14991b576f939af47a12314)), closes [#20](https://github.com/infinidysk/infinidysk-fuse/issues/20)
+
+
+### Bug Fixes
+
+* **connection:** spawned child processes no longer inherit the fuse device ([#68](https://github.com/infinidysk/infinidysk-fuse/issues/68)) ([5426901](https://github.com/infinidysk/infinidysk-fuse/commit/54269017deaddf7ccae9e5ff5b92f89fcd3a7f6d))
+
 ## [0.11.0](https://github.com/infinidysk/infinidysk-fuse/compare/v0.10.1...v0.11.0) (2026-11-19)
 
 
