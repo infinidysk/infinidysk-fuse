@@ -1539,13 +1539,13 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             reply_flags |= FUSE_FILE_OPS;
         }
 
-        if init_in.flags & FUSE_ATOMIC_O_TRUNC > 0 {
+        if init_in.flags & FUSE_ATOMIC_O_TRUNC > 0 && self.mount_options.atomic_o_trunc {
             debug!("enable FUSE_ATOMIC_O_TRUNC");
 
             reply_flags |= FUSE_ATOMIC_O_TRUNC;
         }
 
-        if init_in.flags & FUSE_EXPORT_SUPPORT > 0 {
+        if init_in.flags & FUSE_EXPORT_SUPPORT > 0 && self.mount_options.export_support {
             debug!("enable FUSE_EXPORT_SUPPORT");
 
             reply_flags |= FUSE_EXPORT_SUPPORT;
@@ -1643,7 +1643,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             reply_flags |= FUSE_HANDLE_KILLPRIV;
         }
 
-        if init_in.flags & FUSE_POSIX_ACL > 0 && self.mount_options.default_permissions {
+        if init_in.flags & FUSE_POSIX_ACL > 0 && self.mount_options.posix_acl {
             debug!("enable FUSE_POSIX_ACL");
 
             reply_flags |= FUSE_POSIX_ACL;
@@ -1655,7 +1655,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             reply_flags |= FUSE_MAX_PAGES;
         }
 
-        if init_in.flags & FUSE_CACHE_SYMLINKS > 0 {
+        if init_in.flags & FUSE_CACHE_SYMLINKS > 0 && self.mount_options.cache_symlinks {
             debug!("enable FUSE_CACHE_SYMLINKS");
 
             reply_flags |= FUSE_CACHE_SYMLINKS;
@@ -1682,7 +1682,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         }
 
         #[cfg(target_os = "macos")]
-        if init_in.flags & FUSE_CASE_INSENSITIVE > 0 {
+        if init_in.flags & FUSE_CASE_INSENSITIVE > 0 && self.mount_options.case_insensitive {
             debug!("enable FUSE_CASE_INSENSITIVE");
 
             reply_flags |= FUSE_CASE_INSENSITIVE;

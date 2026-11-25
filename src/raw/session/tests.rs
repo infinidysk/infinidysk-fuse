@@ -263,10 +263,14 @@ impl Harness {
     }
 
     fn start_with(fs: TestFs, grace: Duration) -> Self {
+        Self::start_with_options(fs, grace, MountOptions::default())
+    }
+
+    fn start_with_options(fs: TestFs, grace: Duration, options: MountOptions) -> Self {
         let (connection, kernel) = FuseConnection::memory();
         let fs = Arc::new(fs);
 
-        let mut session = Session::new(MountOptions::default());
+        let mut session = Session::new(options);
         session.fuse_connection = Some(Arc::new(connection));
         session.filesystem = Some(fs.clone());
         session.callback_grace = grace;
@@ -401,6 +405,58 @@ async fn init_replies_with_negotiated_parameters() {
 
     let fs = harness.finish().await;
     assert!(fs.destroyed.load(Ordering::SeqCst));
+}
+
+/// Flags the session must negotiate only when its `MountOptions` opt in.
+fn opt_in_flags() -> u32 {
+    let flags = FUSE_ATOMIC_O_TRUNC | FUSE_EXPORT_SUPPORT | FUSE_POSIX_ACL | FUSE_CACHE_SYMLINKS;
+    #[cfg(target_os = "macos")]
+    let flags = flags | FUSE_CASE_INSENSITIVE;
+    flags
+}
+
+async fn negotiated_flags(options: MountOptions, offered: u32) -> u32 {
+    let mut harness =
+        Harness::start_with_options(TestFs::default(), super::CALLBACK_GRACE, options);
+    let reply = harness.init(offered).await;
+    assert_eq!(out_header(&reply), (reply.len(), 0, 1));
+    harness.finish().await;
+
+    u32_at(&reply[FUSE_OUT_HEADER_SIZE..], 12)
+}
+
+#[tokio::test]
+async fn init_does_not_negotiate_capabilities_by_default() {
+    // default_permissions used to turn on FUSE_POSIX_ACL; it no longer does.
+    let mut options = MountOptions::default();
+    options.default_permissions(true);
+
+    let flags = negotiated_flags(options, opt_in_flags()).await;
+
+    assert_eq!(
+        flags & opt_in_flags(),
+        0,
+        "replied flags {flags:#x} enable a capability without opt-in"
+    );
+}
+
+#[tokio::test]
+async fn init_negotiates_each_opted_in_capability() {
+    let mut options = MountOptions::default();
+    options
+        .atomic_o_trunc(true)
+        .export_support(true)
+        .posix_acl(true)
+        .cache_symlinks(true);
+    #[cfg(target_os = "macos")]
+    options.case_insensitive(true);
+
+    let flags = negotiated_flags(options.clone(), opt_in_flags()).await;
+    assert_eq!(flags & opt_in_flags(), opt_in_flags());
+
+    // An opt-in is still limited to what the kernel offers.
+    let flags = negotiated_flags(options, 0).await;
+    assert_eq!(flags & opt_in_flags(), 0);
 }
 
 #[tokio::test]

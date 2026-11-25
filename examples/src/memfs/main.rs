@@ -502,7 +502,7 @@ impl Filesystem for Fs {
         })
     }
 
-    async fn open(&self, _req: Request, inode: u64, _flags: u32) -> Result<ReplyOpen> {
+    async fn open(&self, _req: Request, inode: u64, flags: u32) -> Result<ReplyOpen> {
         let inner = self.0.read().await;
 
         let entry = inner
@@ -510,7 +510,12 @@ impl Filesystem for Fs {
             .get(&inode)
             .ok_or_else(|| Errno::from(libc::ENOENT))?;
 
-        if matches!(entry, Entry::File(_)) {
+        if let Entry::File(file) = entry {
+            // atomic_o_trunc is enabled, so the kernel sends O_TRUNC here instead of a setattr
+            if flags as i32 & libc::O_TRUNC != 0 {
+                file.write().await.content.clear();
+            }
+
             Ok(ReplyOpen { fh: 0, flags: 0 })
         } else {
             Err(libc::EISDIR.into())
@@ -904,6 +909,7 @@ async fn main() {
     mount_options
         .fs_name("memfs")
         .force_readdir_plus(true)
+        .atomic_o_trunc(true)
         .uid(uid)
         .gid(gid);
 

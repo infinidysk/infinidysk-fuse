@@ -44,6 +44,12 @@ pub struct MountOptions {
     pub(crate) handle_killpriv: bool,
     pub(crate) write_back: bool,
     pub(crate) force_readdir_plus: bool,
+    pub(crate) atomic_o_trunc: bool,
+    pub(crate) export_support: bool,
+    pub(crate) posix_acl: bool,
+    pub(crate) cache_symlinks: bool,
+    #[cfg(target_os = "macos")]
+    pub(crate) case_insensitive: bool,
 
     // Other FUSE mount options
     // default 40000
@@ -167,6 +173,65 @@ impl MountOptions {
     /// this may don't work with some old Linux Kernel.
     pub fn force_readdir_plus(&mut self, force_readdir_plus: bool) -> &mut Self {
         self.force_readdir_plus = force_readdir_plus;
+
+        self
+    }
+
+    /// negotiate `FUSE_ATOMIC_O_TRUNC`, default is disable.
+    ///
+    /// When enabled, the kernel sends `O_TRUNC` in the `open` flags instead of a separate
+    /// `setattr(size = 0)`. The filesystem must then truncate the file in `open` when the flags
+    /// contain `O_TRUNC`.
+    pub fn atomic_o_trunc(&mut self, atomic_o_trunc: bool) -> &mut Self {
+        self.atomic_o_trunc = atomic_o_trunc;
+
+        self
+    }
+
+    /// negotiate `FUSE_EXPORT_SUPPORT`, default is disable.
+    ///
+    /// When enabled, the kernel may send `lookup` for `.` and `..` and may look up inodes it
+    /// has not seen in this mount (for example from NFS file handles). The filesystem must keep
+    /// inode numbers stable and answer those lookups.
+    ///
+    /// Only the raw layer supports this. The path layer rejects it with
+    /// [`InvalidInput`](std::io::ErrorKind::InvalidInput) when mounting, because its inode
+    /// bridge cannot resolve inodes it did not hand out.
+    pub fn export_support(&mut self, export_support: bool) -> &mut Self {
+        self.export_support = export_support;
+
+        self
+    }
+
+    /// negotiate `FUSE_POSIX_ACL`, default is disable.
+    ///
+    /// When enabled, the kernel enforces POSIX ACLs stored in the `system.posix_acl_access` and
+    /// `system.posix_acl_default` extended attributes. The filesystem must store and return those
+    /// attributes through `setxattr`/`getxattr`. On Linux the kernel also turns on
+    /// `default_permissions` checking for the mount when this is negotiated.
+    pub fn posix_acl(&mut self, posix_acl: bool) -> &mut Self {
+        self.posix_acl = posix_acl;
+
+        self
+    }
+
+    /// negotiate `FUSE_CACHE_SYMLINKS`, default is disable.
+    ///
+    /// When enabled, the kernel caches `readlink` results in the page cache. Use it only when
+    /// symlink targets do not change, or invalidate them with the notify API when they do.
+    pub fn cache_symlinks(&mut self, cache_symlinks: bool) -> &mut Self {
+        self.cache_symlinks = cache_symlinks;
+
+        self
+    }
+
+    /// negotiate `FUSE_CASE_INSENSITIVE` (macFUSE), default is disable.
+    ///
+    /// When enabled, macOS treats names as case-insensitive. The filesystem's `lookup` must
+    /// then match names without regard to case.
+    #[cfg(target_os = "macos")]
+    pub fn case_insensitive(&mut self, case_insensitive: bool) -> &mut Self {
+        self.case_insensitive = case_insensitive;
 
         self
     }

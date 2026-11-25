@@ -33,6 +33,33 @@ The crate is imported as `infinidysk_fuse`.
 The two runtime features are mutually exclusive. The crate does not build
 with neither.
 
+## Kernel capabilities are opt-in (breaking change for 0.12)
+
+The session no longer negotiates these INIT capabilities just because the
+kernel offers them. Each one changes what the kernel expects from your
+filesystem, so enable it only when your filesystem handles it:
+
+| Option | Capability | Your filesystem must |
+|--------|------------|----------------------|
+| `MountOptions::atomic_o_trunc` | `FUSE_ATOMIC_O_TRUNC` | Truncate in `open` when the flags contain `O_TRUNC`. |
+| `MountOptions::export_support` | `FUSE_EXPORT_SUPPORT` | Answer `lookup` of `.` and `..` and of inodes it has not handed out in this mount. Raw layer only; the path layer rejects it with `InvalidInput`. |
+| `MountOptions::posix_acl` | `FUSE_POSIX_ACL` | Store and return the `system.posix_acl_*` extended attributes. |
+| `MountOptions::cache_symlinks` | `FUSE_CACHE_SYMLINKS` | Keep symlink targets stable, or invalidate them through `notify`. |
+| `MountOptions::case_insensitive` (macOS) | `FUSE_CASE_INSENSITIVE` | Match names in `lookup` without regard to case. |
+
+All default to off. `default_permissions(true)` no longer turns on
+`FUSE_POSIX_ACL`; call `posix_acl(true)` as well to keep ACL support.
+
+To keep the 0.11 behavior, opt in to what your filesystem supports:
+
+```rust
+let mut options = MountOptions::default();
+options
+    .atomic_o_trunc(true)
+    .posix_acl(true)
+    .cache_symlinks(true);
+```
+
 ## Notifications (breaking change for 0.11)
 
 Every method on the notifier passed to `Filesystem::ready` now returns
@@ -129,8 +156,9 @@ CI builds all three. The mount point must be empty unless you set
 - Unprivileged mounts through `fusermount3`.
 - `readdirplus`, to cut `lookup` round trips when listing directories.
 - POSIX file locks (`file-lock` feature).
-- The `O_TRUNC` open flag, async direct IO, and the `no_open` / `no_open_dir`
-  options.
+- Async direct IO, and the `no_open` / `no_open_dir` options.
+- Opt-in kernel capabilities: atomic `O_TRUNC`, export support (raw layer),
+  POSIX ACLs, symlink caching and, on macOS, case-insensitive names.
 - Kernel notifications through `notify::Notify`: invalidate inode or entry,
   delete, store, retrieve and poll wakeup.
 
